@@ -1,0 +1,24 @@
+name: Daily Chore Push
+
+on:
+  schedule:
+    - cron: '0 0 * * *'      # 北京时间每天早上8点
+  workflow_dispatch:           # 允许手动点运行
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python daily_chore.py
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
+          CHORE_TABLE_ID: ${{ secrets.CHORE_TABLE_ID }}
+          CONFIG_TABLE_ID: ${{ secrets.CONFIG_TABLE_ID }}
+          VIEW_ID: ${{ secrets.VIEW_ID }}
