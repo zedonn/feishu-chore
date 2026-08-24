@@ -64,7 +64,7 @@ def main():
     token = get_token()
     
     # 1. 按视图顺序读取任务（就是你拖拽排好的顺序）
-    chores = get_records(token, CHORE_TABLE_ID, view_id=VIEW_ID)
+    chores = get_records(token, CHORE_TABLE_ID)
     if not chores:
         print("任务表为空"); return
     
