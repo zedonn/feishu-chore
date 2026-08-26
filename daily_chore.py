@@ -104,7 +104,7 @@ def list_records(table_id, view_id=None, page_size=200):
             params["page_token"] = page_token
         result = api_request(
             "GET",
-            f"/base/v1/bases/{BASE_TOKEN}/tables/{table_id}/records",
+            f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records",
             params=params,
         )
         if result.get("code") != 0:
@@ -122,7 +122,7 @@ def update_record(table_id, record_id, fields):
     """更新记录的字段"""
     return api_request(
         "PUT",
-        f"/base/v1/bases/{BASE_TOKEN}/tables/{table_id}/records/{record_id}",
+        f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/{record_id}",
         json_body={"fields": fields},
     )
 
@@ -131,7 +131,7 @@ def get_field(table_id, field_id):
     """获取字段详情（含单选选项）"""
     result = api_request(
         "GET",
-        f"/base/v1/bases/{BASE_TOKEN}/tables/{table_id}/fields/{field_id}",
+        f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/fields/{field_id}",
     )
     if result.get("code") == 0:
         return result.get("data", {}).get("field", {})
