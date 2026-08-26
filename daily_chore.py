@@ -128,13 +128,17 @@ def update_record(table_id, record_id, fields):
 
 
 def get_field(table_id, field_id):
-    """获取字段详情（含单选选项）"""
+    """获取字段详情（含单选选项）。飞书没有单字段获取API，用列出所有字段再筛选。"""
     result = api_request(
         "GET",
-        f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/fields/{field_id}",
+        f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/fields",
+        params={"page_size": 100},
     )
     if result.get("code") == 0:
-        return result.get("data", {}).get("field", {})
+        items = result.get("data", {}).get("items", [])
+        for item in items:
+            if item.get("field_id") == field_id:
+                return item
     return {}
 
 
@@ -225,7 +229,10 @@ def find_current_task(tasks):
 def get_area_order():
     """动态读取「大区域」单选字段的选项顺序"""
     field = get_field(TASK_TABLE_ID, AREA_FIELD_ID)
-    options = field.get("options", [])
+    # 飞书API中单选字段的选项在 property.options 里
+    options = field.get("property", {}).get("options", [])
+    if not options:
+        options = field.get("options", [])  # 兜底
     return [opt.get("name", "") for opt in options if opt.get("name")]
 
 
