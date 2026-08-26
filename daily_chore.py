@@ -77,7 +77,15 @@ def api_request(method, path, params=None, json_body=None):
     resp = requests.request(
         method, url, headers=headers, params=params, json=json_body, timeout=30
     )
-    result = resp.json()
+    # 调试：如果响应不是 JSON，打印原始内容方便排查
+    try:
+        result = resp.json()
+    except Exception:
+        print(f"API 返回非 JSON [{method} {path}]")
+        print(f"  HTTP 状态码: {resp.status_code}")
+        print(f"  响应头 content-type: {resp.headers.get('content-type', '未知')}")
+        print(f"  响应内容前500字: {resp.text[:500]}")
+        sys.exit(1)
     if result.get("code") != 0:
         print(f"API 错误 {method} {path}: {result.get('msg')} (code={result.get('code')})")
     return result
