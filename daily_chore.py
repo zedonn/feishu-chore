@@ -67,7 +67,7 @@ def get_tenant_token():
 
 
 def api_request(method, path, params=None, json_body=None):
-    """统一的飞书 API 请求"""
+    """统一的飞书 API 请求，失败时打印详细信息"""
     token = get_tenant_token()
     headers = {
         "Authorization": f"Bearer {token}",
@@ -77,17 +77,18 @@ def api_request(method, path, params=None, json_body=None):
     resp = requests.request(
         method, url, headers=headers, params=params, json=json_body, timeout=30
     )
-    # 调试：如果响应不是 JSON，打印原始内容方便排查
     try:
         result = resp.json()
     except Exception:
-        print(f"API 返回非 JSON [{method} {path}]")
-        print(f"  HTTP 状态码: {resp.status_code}")
-        print(f"  响应头 content-type: {resp.headers.get('content-type', '未知')}")
-        print(f"  响应内容前500字: {resp.text[:500]}")
-        sys.exit(1)
+        print(f"❌ API 返回非 JSON [{method} {path}]")
+        print(f"  HTTP状态码: {resp.status_code}")
+        print(f"  请求体: {json.dumps(json_body, ensure_ascii=False)[:300] if json_body else '无'}")
+        print(f"  响应前500字: {resp.text[:500]}")
+        return {"code": -1, "msg": "非JSON响应"}
     if result.get("code") != 0:
-        print(f"API 错误 {method} {path}: {result.get('msg')} (code={result.get('code')})")
+        print(f"❌ API错误 [{method} {path}]")
+        print(f"  code: {result.get('code')}, msg: {result.get('msg')}")
+        print(f"  请求体: {json.dumps(json_body, ensure_ascii=False)[:300] if json_body else '无'}")
     return result
 
 
@@ -310,6 +311,13 @@ def main():
     if total == 0:
         print("任务表为空，无法推送")
         return
+
+    # 1.5 清理多余的"是否今日"标记（只保留1条，防止历史残留导致视图显示多条）
+    today_flags = [t for t in tasks if extract_field_value(t["fields"], "是否今日") is True]
+    if len(today_flags) > 1:
+        print(f"⚠️ 发现 {len(today_flags)} 条'是否今日'=true的记录，清理多余的，只保留第1条")
+        for t in today_flags[1:]:
+            update_task(t["record_id"], {"是否今日": False})
 
     # 每日推送模式：按区域重排并更新序号
     if not check_only:
