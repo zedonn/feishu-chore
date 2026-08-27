@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-每日家务任务推送脚本（纯飞书 OpenAPI 版，不依赖 lark-cli）
+每日家务任务推送脚本（每天5条滑动窗口版，纯飞书 OpenAPI）
 
-适合部署到 GitHub Actions / 云服务器等任意 Python 环境。
+逻辑：
+- 每天保持最多5条"是否今日"=true的待办任务
+- 运行时检查：已完成的移出待办，按顺序补充新任务使总数回到5条
+- 所有任务完成一轮后，清空所有"完成"状态，重新开始
+- 支持 --check-only 高频检查模式（无新补充时静默退出）
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -15,10 +19,7 @@
   LARK_DEFAULT_VIEW_ID 默认视图 ID
   LARK_AREA_FIELD_ID  大区域字段 ID
   LARK_USER_OPEN_ID   推送目标用户的 open_id
-
-用法：
-  python daily_chore.py              # 每日完整推送（按区域重排 + 发消息）
-  python daily_chore.py --check-only # 高频检查（仅任务完成时推进并发消息）
+  CHORE_DAILY_COUNT   每天待办数量，默认5
 """
 import json
 import os
@@ -33,6 +34,7 @@ CONFIG_TABLE_ID = os.environ.get("LARK_CONFIG_TABLE_ID", "tbl5WaTKn591sLJ6")
 DEFAULT_VIEW_ID = os.environ.get("LARK_DEFAULT_VIEW_ID", "vewATu0DaX")
 AREA_FIELD_ID = os.environ.get("LARK_AREA_FIELD_ID", "fldYh8CiMt")
 USER_OPEN_ID = os.environ.get("LARK_USER_OPEN_ID", "ou_487b71f46f00d88bbaf1862a0ee1639d")
+DAILY_COUNT = int(os.environ.get("CHORE_DAILY_COUNT", "5"))
 
 APP_ID = os.environ.get("LARK_APP_ID", "")
 APP_SECRET = os.environ.get("LARK_APP_SECRET", "")
@@ -115,7 +117,6 @@ def list_records(table_id, view_id=None, page_size=200):
         if not data.get("has_more"):
             break
         page_token = data.get("page_token")
-    # 统一格式
     return [{"record_id": item["record_id"], "fields": item.get("fields", {})} for item in all_items]
 
 
@@ -172,6 +173,15 @@ def extract_field_value(fields, field_name):
     return str(val)
 
 
+def get_seq(t):
+    """安全获取序号，返回int"""
+    val = extract_field_value(t["fields"], "序号")
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return 0
+
+
 def get_all_tasks_in_order():
     """通过默认视图获取所有任务，返回顺序 = 表格视觉行顺序"""
     return list_records(TASK_TABLE_ID, view_id=DEFAULT_VIEW_ID)
@@ -204,45 +214,18 @@ def update_task(record_id, fields):
     return update_record(TASK_TABLE_ID, record_id, fields)
 
 
-def find_current_task(tasks):
-    """
-    定位当前任务：
-    1. 优先找"是否今日"=true 的记录
-    2. 找不到时用配置表 record_id 兜底
-    3. 还找不到就取第一条
-    """
-    for t in tasks:
-        if extract_field_value(t["fields"], "是否今日") is True:
-            return t, "is_today_flag"
-
-    config = get_config()
-    fallback_rid = config.get("当前任务ID", "")
-    if fallback_rid:
-        for t in tasks:
-            if t["record_id"] == fallback_rid:
-                return t, "config_fallback"
-
-    if tasks:
-        return tasks[0], "first_task"
-    return None, "no_tasks"
-
-
 def get_area_order():
     """动态读取「大区域」单选字段的选项顺序"""
     field = get_field(TASK_TABLE_ID, AREA_FIELD_ID)
-    # 飞书API中单选字段的选项在 property.options 里
     options = field.get("property", {}).get("options", [])
     if not options:
-        options = field.get("options", [])  # 兜底
+        options = field.get("options", [])
     return [opt.get("name", "") for opt in options if opt.get("name")]
 
 
 def reorganize_and_renumber(tasks):
     """
     按「大区域」单选字段的选项顺序重新排列任务，并重排序号为 1,2,3...
-    - 相同区域聚在一起，区域顺序跟随单选字段的选项顺序
-    - 区域内保持原有相对顺序（稳定排序）
-    - 不在选项列表中的区域排到最后
     """
     area_order = get_area_order()
     area_priority = {name: i for i, name in enumerate(area_order)}
@@ -258,7 +241,7 @@ def reorganize_and_renumber(tasks):
     updated = 0
     for i, t in enumerate(tasks):
         expected_seq = i + 1
-        current_seq = t["fields"].get("序号")
+        current_seq = get_seq(t)
         if current_seq != expected_seq:
             update_task(t["record_id"], {"序号": expected_seq})
             updated += 1
@@ -271,25 +254,38 @@ def reorganize_and_renumber(tasks):
 
 
 def send_message(task_info):
-    """组装并发送今日任务消息"""
-    pos = task_info.get("position", "")
-    total = task_info.get("total", "")
-    area = task_info.get("area", "")
-    small_area = task_info.get("small_area", "")
-    method = task_info.get("method", "")
-    has_image = task_info.get("has_image", False)
+    """组装并发送今日任务消息（支持多条滑动窗口）"""
+    total_today = task_info.get("total_today", 0)
+    new_count = task_info.get("new_count", 0)
+    remaining_count = task_info.get("remaining_count", 0)
+    tasks = task_info.get("tasks", [])
+    new_task_ids = task_info.get("new_task_ids", set())
 
     lines = [
         "🧹 今日家务任务",
         "━━━━━━━━━━━━━━━",
-        f"📋 第 {pos}/{total} 项",
-        f"📍 区域：{area}",
-        f"🎯 内容：{small_area}",
+        f"📋 共 {total_today} 条待办（新增 {new_count} 条，延续 {remaining_count} 条）",
+        "",
     ]
-    if method:
-        lines.append(f"💡 方法：{method}")
-    if has_image:
-        lines.append("🖼️  参考图片：请在多维表格「今日任务」视图查看")
+
+    new_tasks = [t for t in tasks if t["record_id"] in new_task_ids]
+    if new_tasks:
+        lines.append("🆕 新增：")
+        for t in new_tasks:
+            area = extract_field_value(t["fields"], "大区域")
+            small = extract_field_value(t["fields"], "小区域") or "(未填写)"
+            lines.append(f"  • [{area}] {small}")
+        lines.append("")
+
+    remaining_tasks = [t for t in tasks if t["record_id"] not in new_task_ids]
+    if remaining_tasks:
+        lines.append("🔄 延续（昨日未完成）：")
+        for t in remaining_tasks:
+            area = extract_field_value(t["fields"], "大区域")
+            small = extract_field_value(t["fields"], "小区域") or "(未填写)"
+            lines.append(f"  • [{area}] {small}")
+        lines.append("")
+
     lines.append("━━━━━━━━━━━━━━━")
     lines.append("完成后请在多维表格中勾选「完成」✅")
     lines.append(f"多维表格链接：https://my.feishu.cn/base/{BASE_TOKEN}")
@@ -301,7 +297,7 @@ def send_message(task_info):
 def main():
     check_only = "--check-only" in sys.argv
     mode = "高频检查" if check_only else "每日推送"
-    print(f"=== 每日家务任务推送（{mode}模式）===")
+    print(f"=== 每日家务任务推送（{mode}模式，每天{DAILY_COUNT}条滑动窗口）===")
 
     # 1. 获取所有任务
     tasks = get_all_tasks_in_order()
@@ -312,71 +308,83 @@ def main():
         print("任务表为空，无法推送")
         return
 
-    # 1.5 清理多余的"是否今日"标记（只保留1条，防止历史残留导致视图显示多条）
-    today_flags = [t for t in tasks if extract_field_value(t["fields"], "是否今日") is True]
-    if len(today_flags) > 1:
-        print(f"⚠️ 发现 {len(today_flags)} 条'是否今日'=true的记录，清理多余的，只保留第1条")
-        for t in today_flags[1:]:
-            update_task(t["record_id"], {"是否今日": False})
-
-    # 每日推送模式：按区域重排并更新序号
+    # 2. 每日推送模式：按区域重排并更新序号
     if not check_only:
         tasks = reorganize_and_renumber(tasks)
-        tasks = get_all_tasks_in_order()  # 重排后重新获取
+        tasks = get_all_tasks_in_order()
 
-    # 2. 定位当前任务
-    current_task, locate_method = find_current_task(tasks)
-    if not current_task:
-        print("无法定位当前任务")
-        return
+    # 3. 找出当前待办（是否今日=true）
+    today_tasks = [t for t in tasks if extract_field_value(t["fields"], "是否今日") is True]
+    print(f"当前待办数: {len(today_tasks)}")
 
-    current_idx = tasks.index(current_task)
-    current_fields = current_task["fields"]
-    current_record_id = current_task["record_id"]
-    is_done = extract_field_value(current_fields, "完成") is True
-    print(f"当前任务: 位置[{current_idx+1}/{total}] 定位方式:{locate_method} 已完成:{is_done}")
+    # 4. 如果待办超过DAILY_COUNT条，清理多余的（历史残留）
+    if len(today_tasks) > DAILY_COUNT:
+        print(f"⚠️ 待办数超过{DAILY_COUNT}条，清理多余的")
+        today_tasks.sort(key=get_seq)
+        for t in today_tasks[DAILY_COUNT:]:
+            update_task(t["record_id"], {"是否今日": False})
+        today_tasks = today_tasks[:DAILY_COUNT]
 
-    # 3. 高频检查模式：如果未完成，静默退出
-    if check_only and not is_done:
-        print("当前任务未完成，静默退出（不推送）")
-        return
+    # 5. 统计已完成的，移出待办
+    done_tasks = [t for t in today_tasks if extract_field_value(t["fields"], "完成") is True]
+    remaining_tasks = [t for t in today_tasks if extract_field_value(t["fields"], "完成") is not True]
+    print(f"已完成: {len(done_tasks)}条，延续: {len(remaining_tasks)}条")
 
-    # 4. 判断是否推进
-    today_task = current_task
-    if is_done:
-        next_idx = (current_idx + 1) % total
-        is_new_round = (next_idx == 0)
+    for t in done_tasks:
+        update_task(t["record_id"], {"是否今日": False})
 
-        if is_new_round:
-            print("完成一轮循环，清空所有任务的完成状态")
-            for t in tasks:
-                if extract_field_value(t["fields"], "完成") is True:
-                    update_task(t["record_id"], {"完成": False})
+    # 6. 计算需要补充多少条
+    need_to_add = DAILY_COUNT - len(remaining_tasks)
+    if need_to_add < 0:
+        need_to_add = 0
+    print(f"需要补充: {need_to_add}条")
 
-        update_task(current_record_id, {"是否今日": False, "完成": False})
+    # 7. 按顺序补充新任务
+    new_tasks = []
+    if need_to_add > 0:
+        if today_tasks:
+            max_seq = max(get_seq(t) for t in today_tasks)
+            # 先从序号 > max_seq 的任务中选
+            candidates = [t for t in tasks if get_seq(t) > max_seq]
+            # 不够的话从开头补充（循环）
+            candidates += [t for t in tasks if get_seq(t) <= max_seq]
+        else:
+            candidates = tasks
 
-        today_task = tasks[next_idx]
-        update_task(today_task["record_id"], {"是否今日": True})
-        update_config("当前任务ID", today_task["record_id"])
-        print(f"推进到位置[{next_idx+1}/{total}]")
-    else:
-        print("当前任务未完成，保持不变")
-        if locate_method != "is_today_flag":
-            update_task(current_record_id, {"是否今日": True})
-            update_config("当前任务ID", current_record_id)
+        today_ids = {t["record_id"] for t in today_tasks}
+        candidates = [t for t in candidates if t["record_id"] not in today_ids]
 
-    # 5. 组装并发送消息
-    today_fields = today_task["fields"]
-    today_idx = tasks.index(today_task)
+        new_tasks = candidates[:need_to_add]
+        for t in new_tasks:
+            update_task(t["record_id"], {"是否今日": True})
+        print(f"已补充: {len(new_tasks)}条")
+
+    # 8. 检查是否一轮完成（所有任务的完成都是true）
+    all_done = all(extract_field_value(t["fields"], "完成") is True for t in tasks)
+    if all_done:
+        print("🎉 完成一轮循环，清空所有任务的完成状态")
+        for t in tasks:
+            update_task(t["record_id"], {"完成": False})
+
+    # 9. 重新获取当前待办，发送消息
+    tasks = get_all_tasks_in_order()
+    final_today = [t for t in tasks if extract_field_value(t["fields"], "是否今日") is True]
+    final_today.sort(key=get_seq)
+
     task_info = {
-        "position": today_idx + 1,
-        "total": total,
-        "area": extract_field_value(today_fields, "大区域"),
-        "small_area": extract_field_value(today_fields, "小区域") or "(未填写内容)",
-        "method": extract_field_value(today_fields, "清洗方法"),
-        "has_image": bool(today_fields.get("参考图片")),
+        "total_today": len(final_today),
+        "new_count": len(new_tasks),
+        "remaining_count": len(remaining_tasks),
+        "tasks": final_today,
+        "new_task_ids": {t["record_id"] for t in new_tasks},
     }
-    print(f"今日任务: 位置[{task_info['position']}/{total}] [{task_info['area']}] {task_info['small_area'][:30]}")
+
+    print(f"最终待办: {len(final_today)}条（新增{len(new_tasks)}条，延续{len(remaining_tasks)}条）")
+
+    # 高频检查模式：如果没有新补充的任务，静默退出
+    if check_only and len(new_tasks) == 0:
+        print("高频检查：无新补充任务，静默退出")
+        return
 
     success = send_message(task_info)
     print(f"消息推送: {'成功' if success else '失败'}")
