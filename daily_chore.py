@@ -299,22 +299,24 @@ def main():
     mode = "高频检查" if check_only else "每日推送"
     print(f"=== 每日家务任务推送（{mode}模式，每天{DAILY_COUNT}条滑动窗口）===")
 
-    # 1. 获取所有任务
+    # 1. 获取所有任务（按默认视图行顺序），过滤空记录
     tasks = get_all_tasks_in_order()
     total = len(tasks)
-    print(f"当前任务总数: {total}")
+    valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+    print(f"当前任务总数: {total}，有效任务: {len(valid_tasks)}")
 
-    if total == 0:
-        print("任务表为空，无法推送")
+    if len(valid_tasks) == 0:
+        print("没有有效任务，无法推送")
         return
 
-    # 2. 每日推送模式：按区域重排并更新序号
+    # 2. 每日推送模式：按区域重排并更新序号（只对有效记录）
     if not check_only:
-        tasks = reorganize_and_renumber(tasks)
+        reorganize_and_renumber(valid_tasks)
         tasks = get_all_tasks_in_order()
+        valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
 
-    # 3. 找出当前待办（是否今日=true）
-    today_tasks = [t for t in tasks if extract_field_value(t["fields"], "是否今日") is True]
+    # 3. 找出当前待办（是否今日=true，在有效记录中）
+    today_tasks = [t for t in valid_tasks if extract_field_value(t["fields"], "是否今日") is True]
     print(f"当前待办数: {len(today_tasks)}")
 
     # 4. 如果待办超过DAILY_COUNT条，清理多余的（历史残留）
@@ -339,36 +341,44 @@ def main():
         need_to_add = 0
     print(f"需要补充: {need_to_add}条")
 
-    # 7. 按顺序补充新任务
+    # 7. 按行顺序补充新任务（基于 valid_tasks 的位置，不依赖序号）
     new_tasks = []
     if need_to_add > 0:
-        if today_tasks:
-            max_seq = max(get_seq(t) for t in today_tasks)
-            # 先从序号 > max_seq 的任务中选
-            candidates = [t for t in tasks if get_seq(t) > max_seq]
-            # 不够的话从开头补充（循环）
-            candidates += [t for t in tasks if get_seq(t) <= max_seq]
-        else:
-            candidates = tasks
-
         today_ids = {t["record_id"] for t in today_tasks}
-        candidates = [t for t in candidates if t["record_id"] not in today_ids]
-
+        # 找到延续任务在 valid_tasks 中的最大行位置
+        remaining_ids = {t["record_id"] for t in remaining_tasks}
+        if remaining_ids:
+            max_index = max(i for i, t in enumerate(valid_tasks) if t["record_id"] in remaining_ids)
+        elif today_tasks:
+            max_index = max(i for i, t in enumerate(valid_tasks) if t["record_id"] in today_ids)
+        else:
+            max_index = -1
+        # 从 max_index+1 开始循环选取，排除当前待办
+        candidates = []
+        n = len(valid_tasks)
+        for offset in range(1, n + 1):
+            idx = (max_index + offset) % n
+            t = valid_tasks[idx]
+            if t["record_id"] not in today_ids:
+                candidates.append(t)
+            if len(candidates) >= need_to_add:
+                break
         new_tasks = candidates[:need_to_add]
         for t in new_tasks:
             update_task(t["record_id"], {"是否今日": True})
         print(f"已补充: {len(new_tasks)}条")
 
-    # 8. 检查是否一轮完成（所有任务的完成都是true）
-    all_done = all(extract_field_value(t["fields"], "完成") is True for t in tasks)
+    # 8. 检查是否一轮完成（所有有效任务的完成都是true）
+    all_done = all(extract_field_value(t["fields"], "完成") is True for t in valid_tasks)
     if all_done:
         print("🎉 完成一轮循环，清空所有任务的完成状态")
-        for t in tasks:
+        for t in valid_tasks:
             update_task(t["record_id"], {"完成": False})
 
     # 9. 重新获取当前待办，发送消息
     tasks = get_all_tasks_in_order()
-    final_today = [t for t in tasks if extract_field_value(t["fields"], "是否今日") is True]
+    valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+    final_today = [t for t in valid_tasks if extract_field_value(t["fields"], "是否今日") is True]
     final_today.sort(key=get_seq)
 
     task_info = {
