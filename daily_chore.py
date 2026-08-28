@@ -4,9 +4,13 @@
 
 逻辑：
 - 每天保持最多5条"是否今日"=true的待办任务
-- 运行时检查：已完成的移出待办，按顺序补充新任务使总数回到5条
+- 智能补充：今天完成几条，明天就从后面补几条，没完成就原样保留
+  例：完成1条剩2345 → 明天补6变成23456；全完成 → 明天推678910
+- 序号原位重排：不移动任何条目的位置，只按当前行顺序把序号改写成1,2,3...
+  （注意：「序号」字段必须是「数字」类型；若是「自动编号」则API无法写入，脚本会提示并跳过）
 - 所有任务完成一轮后，清空所有"完成"状态，重新开始
 - 支持 --check-only 高频检查模式（无新补充时静默退出）
+- 自动清理空记录上残留的"是否今日"标记（修复视图多出空行的问题）
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -17,7 +21,6 @@
   LARK_TASK_TABLE_ID  家务任务表 ID
   LARK_CONFIG_TABLE_ID 系统配置表 ID
   LARK_DEFAULT_VIEW_ID 默认视图 ID
-  LARK_AREA_FIELD_ID  大区域字段 ID
   LARK_USER_OPEN_ID   推送目标用户的 open_id
   CHORE_DAILY_COUNT   每天待办数量，默认5
 """
@@ -32,7 +35,6 @@ BASE_TOKEN = os.environ.get("LARK_BASE_TOKEN", "GIgLbeJDUadS17sreyNcX7jknoe")
 TASK_TABLE_ID = os.environ.get("LARK_TASK_TABLE_ID", "tblOo1DKyKgs0CV4")
 CONFIG_TABLE_ID = os.environ.get("LARK_CONFIG_TABLE_ID", "tbl5WaTKn591sLJ6")
 DEFAULT_VIEW_ID = os.environ.get("LARK_DEFAULT_VIEW_ID", "vewATu0DaX")
-AREA_FIELD_ID = os.environ.get("LARK_AREA_FIELD_ID", "fldYh8CiMt")
 USER_OPEN_ID = os.environ.get("LARK_USER_OPEN_ID", "ou_487b71f46f00d88bbaf1862a0ee1639d")
 DAILY_COUNT = int(os.environ.get("CHORE_DAILY_COUNT", "5"))
 
@@ -129,19 +131,16 @@ def update_record(table_id, record_id, fields):
     )
 
 
-def get_field(table_id, field_id):
-    """获取字段详情（含单选选项）。飞书没有单字段获取API，用列出所有字段再筛选。"""
+def list_fields(table_id):
+    """列出表的所有字段"""
     result = api_request(
         "GET",
         f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/fields",
         params={"page_size": 100},
     )
     if result.get("code") == 0:
-        items = result.get("data", {}).get("items", [])
-        for item in items:
-            if item.get("field_id") == field_id:
-                return item
-    return {}
+        return result.get("data", {}).get("items", [])
+    return []
 
 
 def send_text_message(open_id, text):
@@ -214,29 +213,22 @@ def update_task(record_id, fields):
     return update_record(TASK_TABLE_ID, record_id, fields)
 
 
-def get_area_order():
-    """动态读取「大区域」单选字段的选项顺序"""
-    field = get_field(TASK_TABLE_ID, AREA_FIELD_ID)
-    options = field.get("property", {}).get("options", [])
-    if not options:
-        options = field.get("options", [])
-    return [opt.get("name", "") for opt in options if opt.get("name")]
-
-
-def reorganize_and_renumber(tasks):
+def renumber_by_row_order(tasks):
     """
-    按「大区域」单选字段的选项顺序重新排列任务，并重排序号为 1,2,3...
+    序号原位重排：不移动任何条目的位置，
+    只按当前行顺序（默认视图顺序）把序号改写成 1,2,3...
+    空记录不占序号。
     """
-    area_order = get_area_order()
-    area_priority = {name: i for i, name in enumerate(area_order)}
-    print(f"读取到区域选项顺序: {' → '.join(area_order) if area_order else '(获取失败)'}")
-
-    def sort_key(t):
-        area = extract_field_value(t["fields"], "大区域")
-        priority = area_priority.get(area, len(area_order) + 1)
-        return (priority, area)
-
-    tasks.sort(key=sort_key)
+    # 先检查「序号」字段类型：自动编号字段 API 无法写入
+    seq_field = None
+    for f in list_fields(TASK_TABLE_ID):
+        if f.get("field_name") == "序号":
+            seq_field = f
+            break
+    if seq_field and seq_field.get("ui_type") == "AutoNumber":
+        print("⚠️ 「序号」是【自动编号】字段，飞书不允许通过 API 修改，已跳过重排")
+        print("   如需序号自动重排，请在多维表格中把「序号」字段类型改为【数字】")
+        return tasks
 
     updated = 0
     for i, t in enumerate(tasks):
@@ -247,9 +239,9 @@ def reorganize_and_renumber(tasks):
             updated += 1
 
     if updated > 0:
-        print(f"按区域重排并更新序号：调整了 {updated} 条")
+        print(f"序号原位重排完成：更新了 {updated} 条（条目位置不变）")
     else:
-        print("序号已是按区域排列，无需调整")
+        print("序号已是连续排列，无需调整")
     return tasks
 
 
@@ -309,14 +301,23 @@ def main():
         print("没有有效任务，无法推送")
         return
 
-    # 2. 每日推送模式：按区域重排并更新序号（只对有效记录）
+    # 2. 每日推送模式：序号原位重排（不移动条目位置，只对有效记录编序号）
     if not check_only:
-        reorganize_and_renumber(valid_tasks)
+        renumber_by_row_order(valid_tasks)
         tasks = get_all_tasks_in_order()
         valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
 
-    # 3. 找出当前待办（是否今日=true，在有效记录中）
-    today_tasks = [t for t in valid_tasks if extract_field_value(t["fields"], "是否今日") is True]
+    # 3. 清理残留 + 统计当前待办
+    #    注意：必须在【全部记录】里找「是否今日」=true，
+    #    否则空记录上的残留标记永远无法清除，会导致「今日任务」视图多出行
+    valid_ids = {t["record_id"] for t in valid_tasks}
+    all_today = [t for t in tasks if extract_field_value(t["fields"], "是否今日") is True]
+    stale_today = [t for t in all_today if t["record_id"] not in valid_ids]
+    if stale_today:
+        print(f"⚠️ 发现 {len(stale_today)} 条空记录残留「是否今日」标记，自动清理")
+        for t in stale_today:
+            update_task(t["record_id"], {"是否今日": False})
+    today_tasks = [t for t in all_today if t["record_id"] in valid_ids]
     print(f"当前待办数: {len(today_tasks)}")
 
     # 4. 如果待办超过DAILY_COUNT条，清理多余的（历史残留）
@@ -327,7 +328,7 @@ def main():
             update_task(t["record_id"], {"是否今日": False})
         today_tasks = today_tasks[:DAILY_COUNT]
 
-    # 5. 统计已完成的，移出待办
+    # 5. 统计已完成的，移出待办（智能补充：完成几条就补几条）
     done_tasks = [t for t in today_tasks if extract_field_value(t["fields"], "完成") is True]
     remaining_tasks = [t for t in today_tasks if extract_field_value(t["fields"], "完成") is not True]
     print(f"已完成: {len(done_tasks)}条，延续: {len(remaining_tasks)}条")
@@ -335,13 +336,13 @@ def main():
     for t in done_tasks:
         update_task(t["record_id"], {"是否今日": False})
 
-    # 6. 计算需要补充多少条
+    # 6. 计算需要补充多少条（未完成的一条不补，原样保留到明天）
     need_to_add = DAILY_COUNT - len(remaining_tasks)
     if need_to_add < 0:
         need_to_add = 0
     print(f"需要补充: {need_to_add}条")
 
-    # 7. 按行顺序补充新任务（基于 valid_tasks 的位置，不依赖序号）
+    # 7. 按行顺序补充新任务（从延续任务的最后位置往后取，保证 6 排在 5 后面）
     new_tasks = []
     if need_to_add > 0:
         today_ids = {t["record_id"] for t in today_tasks}
