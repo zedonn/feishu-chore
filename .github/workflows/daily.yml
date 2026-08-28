@@ -2,7 +2,7 @@ name: 每日家务任务推送
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 北京时间 8:00
+    - cron: "7 20 * * *"   # 北京时间 4:07（UTC 20:07，注意UTC日期是前一天，这是正常的）
   workflow_dispatch:
 
 jobs:
