@@ -6,11 +6,15 @@
 - 每天保持最多5条"是否今日"=true的待办任务
 - 智能补充：今天完成几条，明天就从后面补几条，没完成就原样保留
   例：完成1条剩2345 → 明天补6变成23456；全完成 → 明天推678910
+- 补充时跳过「完成」=true的任务（已完成的这一轮不再回来）
+- 一轮完成判定提前：所有任务都完成时，先清空全部「完成」标记开启新一轮，再补充
 - 序号原位重排：不移动任何条目的位置，只按当前行顺序把序号改写成1,2,3...
   （注意：「序号」字段必须是「数字」类型；若是「自动编号」则API无法写入，脚本会提示并跳过）
-- 所有任务完成一轮后，清空所有"完成"状态，重新开始
+- 完成记录：检测到打钩完成的任务时，自动写入「完成记录」表（表不存在则自动创建）
 - 支持 --check-only 高频检查模式（无新补充时静默退出）
-- 自动清理空记录上残留的"是否今日"标记（修复视图多出空行的问题）
+- 支持 --reset 重置模式：清空所有任务的「是否今日」和「完成」标记，
+  然后自动从头补充第1~5条（本地调试用，GitHub 上不需要）
+- 自动清理空记录上残留的"是否今日"标记
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -28,6 +32,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone, timedelta
 import requests
 
 # ============ 配置 ============
@@ -42,6 +47,8 @@ APP_ID = os.environ.get("LARK_APP_ID", "")
 APP_SECRET = os.environ.get("LARK_APP_SECRET", "")
 
 API_BASE = "https://open.feishu.cn/open-apis"
+BEIJING_TZ = timezone(timedelta(hours=8))
+LOG_TABLE_NAME = "完成记录"
 
 # ============ 飞书 API 基础封装 ============
 _tenant_token = None
@@ -213,6 +220,24 @@ def update_task(record_id, fields):
     return update_record(TASK_TABLE_ID, record_id, fields)
 
 
+def reset_all_flags(tasks):
+    """
+    重置模式：清空所有记录（含空记录）的「是否今日」和「完成」标记。
+    之后主流程会自动从头补充第1~DAILY_COUNT条。
+    """
+    cleared = 0
+    for t in tasks:
+        updates = {}
+        if extract_field_value(t["fields"], "是否今日") is True:
+            updates["是否今日"] = False
+        if extract_field_value(t["fields"], "完成") is True:
+            updates["完成"] = False
+        if updates:
+            update_task(t["record_id"], updates)
+            cleared += 1
+    print(f"🔄 重置完成：清除了 {cleared} 条记录的标记")
+
+
 def renumber_by_row_order(tasks):
     """
     序号原位重排：不移动任何条目的位置，
@@ -243,6 +268,74 @@ def renumber_by_row_order(tasks):
     else:
         print("序号已是连续排列，无需调整")
     return tasks
+
+
+def get_or_create_log_table():
+    """查找「完成记录」表，不存在则自动创建，返回 table_id"""
+    result = api_request(
+        "GET",
+        f"/bitable/v1/apps/{BASE_TOKEN}/tables",
+        params={"page_size": 100},
+    )
+    if result.get("code") == 0:
+        for tb in result.get("data", {}).get("items", []):
+            if tb.get("name") == LOG_TABLE_NAME:
+                return tb.get("table_id")
+
+    # 表不存在，自动创建（字段：完成日期/大区域/小区域/具体区域描述）
+    body = {
+        "table": {
+            "name": LOG_TABLE_NAME,
+            "default_view_name": "全部记录",
+            "fields": [
+                {"field_name": "完成日期", "type": 5, "property": {"date_formatter": "yyyy/MM/dd"}},
+                {"field_name": "大区域", "type": 1},
+                {"field_name": "小区域", "type": 1},
+                {"field_name": "具体区域描述", "type": 1},
+            ],
+        }
+    }
+    result = api_request("POST", f"/bitable/v1/apps/{BASE_TOKEN}/tables", json_body=body)
+    if result.get("code") == 0:
+        table_id = result.get("data", {}).get("table_id")
+        print(f"📝 已自动创建「{LOG_TABLE_NAME}」表: {table_id}")
+        return table_id
+    return None
+
+
+def log_completed_tasks(done_tasks):
+    """把本次检测到完成的任务写入「完成记录」表"""
+    if not done_tasks:
+        return
+    table_id = get_or_create_log_table()
+    if not table_id:
+        print("⚠️ 完成记录表不可用，跳过记录")
+        return
+
+    now = datetime.now(BEIJING_TZ)
+    day_start = datetime(now.year, now.month, now.day, tzinfo=BEIJING_TZ)
+    date_ts = int(day_start.timestamp() * 1000)  # 日期字段用毫秒时间戳
+
+    records = []
+    for t in done_tasks:
+        records.append({
+            "fields": {
+                "完成日期": date_ts,
+                "大区域": extract_field_value(t["fields"], "大区域"),
+                "小区域": extract_field_value(t["fields"], "小区域"),
+                "具体区域描述": extract_field_value(t["fields"], "具体区域描述"),
+            }
+        })
+
+    result = api_request(
+        "POST",
+        f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/batch_create",
+        json_body={"records": records},
+    )
+    if result.get("code") == 0:
+        print(f"📝 已写入 {len(records)} 条完成记录（{now.strftime('%Y-%m-%d')}）")
+    else:
+        print("⚠️ 完成记录写入失败")
 
 
 def send_message(task_info):
@@ -288,7 +381,10 @@ def send_message(task_info):
 
 def main():
     check_only = "--check-only" in sys.argv
+    reset_mode = "--reset" in sys.argv
     mode = "高频检查" if check_only else "每日推送"
+    if reset_mode:
+        mode += "+重置"
     print(f"=== 每日家务任务推送（{mode}模式，每天{DAILY_COUNT}条滑动窗口）===")
 
     # 1. 获取所有任务（按默认视图行顺序），过滤空记录
@@ -301,13 +397,19 @@ def main():
         print("没有有效任务，无法推送")
         return
 
-    # 2. 每日推送模式：序号原位重排（不移动条目位置，只对有效记录编序号）
+    # 2. 重置模式：清空所有标记，从头开始（之后会自动补第1~5条）
+    if reset_mode:
+        reset_all_flags(tasks)
+        tasks = get_all_tasks_in_order()
+        valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+
+    # 3. 每日推送模式：序号原位重排（不移动条目位置，只对有效记录编序号）
     if not check_only:
         renumber_by_row_order(valid_tasks)
         tasks = get_all_tasks_in_order()
         valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
 
-    # 3. 清理残留 + 统计当前待办
+    # 4. 清理残留 + 统计当前待办
     #    注意：必须在【全部记录】里找「是否今日」=true，
     #    否则空记录上的残留标记永远无法清除，会导致「今日任务」视图多出行
     valid_ids = {t["record_id"] for t in valid_tasks}
@@ -320,7 +422,7 @@ def main():
     today_tasks = [t for t in all_today if t["record_id"] in valid_ids]
     print(f"当前待办数: {len(today_tasks)}")
 
-    # 4. 如果待办超过DAILY_COUNT条，清理多余的（历史残留）
+    # 5. 如果待办超过DAILY_COUNT条，清理多余的（历史残留）
     if len(today_tasks) > DAILY_COUNT:
         print(f"⚠️ 待办数超过{DAILY_COUNT}条，清理多余的")
         today_tasks.sort(key=get_seq)
@@ -328,21 +430,37 @@ def main():
             update_task(t["record_id"], {"是否今日": False})
         today_tasks = today_tasks[:DAILY_COUNT]
 
-    # 5. 统计已完成的，移出待办（智能补充：完成几条就补几条）
+    # 6. 统计已完成的，移出待办（智能补充：完成几条就补几条）
     done_tasks = [t for t in today_tasks if extract_field_value(t["fields"], "完成") is True]
     remaining_tasks = [t for t in today_tasks if extract_field_value(t["fields"], "完成") is not True]
     print(f"已完成: {len(done_tasks)}条，延续: {len(remaining_tasks)}条")
 
+    # 6.1 把完成的任务写入「完成记录」表
+    log_completed_tasks(done_tasks)
+
     for t in done_tasks:
         update_task(t["record_id"], {"是否今日": False})
 
-    # 6. 计算需要补充多少条（未完成的一条不补，原样保留到明天）
+    # 7. 一轮完成判定【提前到补充之前】：
+    #    所有有效任务都完成 → 清空全部「完成」标记，开启新一轮
+    if all(extract_field_value(t["fields"], "完成") is True for t in valid_tasks):
+        print("🎉 完成一轮循环，清空所有任务的完成状态，开启新一轮")
+        for t in valid_tasks:
+            update_task(t["record_id"], {"完成": False})
+        # 重新拉取，确保后续补充逻辑读到的是清空后的状态
+        tasks = get_all_tasks_in_order()
+        valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+
+    # 8. 计算需要补充多少条（未完成的一条不补，原样保留到明天）
     need_to_add = DAILY_COUNT - len(remaining_tasks)
     if need_to_add < 0:
         need_to_add = 0
     print(f"需要补充: {need_to_add}条")
 
-    # 7. 按行顺序补充新任务（从延续任务的最后位置往后取，保证 6 排在 5 后面）
+    # 9. 按行顺序补充新任务
+    #    规则：从延续任务的最后位置往后取，跳过两类：
+    #    - 当前待办（today_ids）
+    #    - 已完成（「完成」=true）的任务——已完成的这一轮不再回来，防止空转
     new_tasks = []
     if need_to_add > 0:
         today_ids = {t["record_id"] for t in today_tasks}
@@ -354,29 +472,26 @@ def main():
             max_index = max(i for i, t in enumerate(valid_tasks) if t["record_id"] in today_ids)
         else:
             max_index = -1
-        # 从 max_index+1 开始循环选取，排除当前待办
         candidates = []
         n = len(valid_tasks)
         for offset in range(1, n + 1):
             idx = (max_index + offset) % n
             t = valid_tasks[idx]
-            if t["record_id"] not in today_ids:
-                candidates.append(t)
+            if t["record_id"] in today_ids:
+                continue
+            if extract_field_value(t["fields"], "完成") is True:
+                continue  # 跳过已完成
+            candidates.append(t)
             if len(candidates) >= need_to_add:
                 break
         new_tasks = candidates[:need_to_add]
         for t in new_tasks:
             update_task(t["record_id"], {"是否今日": True})
         print(f"已补充: {len(new_tasks)}条")
+        if len(new_tasks) < need_to_add:
+            print(f"⚠️ 未完成的候选任务不足，本次只补了 {len(new_tasks)} 条")
 
-    # 8. 检查是否一轮完成（所有有效任务的完成都是true）
-    all_done = all(extract_field_value(t["fields"], "完成") is True for t in valid_tasks)
-    if all_done:
-        print("🎉 完成一轮循环，清空所有任务的完成状态")
-        for t in valid_tasks:
-            update_task(t["record_id"], {"完成": False})
-
-    # 9. 重新获取当前待办，发送消息
+    # 10. 重新获取当前待办，发送消息
     tasks = get_all_tasks_in_order()
     valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
     final_today = [t for t in valid_tasks if extract_field_value(t["fields"], "是否今日") is True]
