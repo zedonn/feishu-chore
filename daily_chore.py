@@ -21,6 +21,8 @@
 - 有效任务判定：「小区域」「参考图片」「具体区域描述」任意一个有内容即算有效
   （仅填「大区域」不算；「序号」「是否今日」「完成」由脚本写入，不参与判定）
 - 推送显示名依次取：小区域 → 具体区域描述 → （见表格参考图片）
+- 所有批量写操作走飞书批量接口（单包最多450条，自动分包），速度从
+  "每行1~3秒"降到"全部1~3秒"；批量被拒时自动降级逐行更新，定位问题行
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -142,6 +144,33 @@ def update_record(table_id, record_id, fields):
         f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/{record_id}",
         json_body={"fields": fields},
     )
+
+
+def batch_update_records(table_id, updates):
+    """
+    批量更新记录：updates = [(record_id, fields), ...]
+    - 单包最多450条，自动分包，一次请求搞定全部（避免逐行跨洋请求）
+    - 若整包被飞书拒收（某行数据有问题），自动降级为逐行更新，
+      好行照常改，问题行单独报出来，不会被拖垮
+    """
+    if not updates:
+        return
+    CHUNK = 450
+    for start in range(0, len(updates), CHUNK):
+        chunk = updates[start:start + CHUNK]
+        body = {"records": [{"record_id": rid, "fields": f} for rid, f in chunk]}
+        result = api_request(
+            "POST",
+            f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/batch_update",
+            json_body=body,
+        )
+        if result.get("code") == 0:
+            continue
+        print(f"⚠️ 批量更新被拒（{len(chunk)} 条），降级为逐行更新以定位问题行")
+        for rid, f in chunk:
+            r = update_record(table_id, rid, f)
+            if r.get("code") != 0:
+                print(f"   ❌ 问题行 record_id={rid}，已跳过，其余行不受影响")
 
 
 def list_fields(table_id):
@@ -276,17 +305,17 @@ def reset_all_flags(tasks):
     重置模式：清空所有记录（含空记录）的「是否今日」和「完成」标记。
     之后主流程会自动从头补充第1~DAILY_COUNT条。
     """
-    cleared = 0
+    updates = []
     for t in tasks:
-        updates = {}
+        u = {}
         if extract_field_value(t["fields"], "是否今日") is True:
-            updates["是否今日"] = False
+            u["是否今日"] = False
         if extract_field_value(t["fields"], "完成") is True:
-            updates["完成"] = False
-        if updates:
-            update_task(t["record_id"], updates)
-            cleared += 1
-    print(f"🔄 重置完成：清除了 {cleared} 条记录的标记")
+            u["完成"] = False
+        if u:
+            updates.append((t["record_id"], u))
+    batch_update_records(TASK_TABLE_ID, updates)
+    print(f"🔄 重置完成：清除了 {len(updates)} 条记录的标记")
 
 
 def renumber_by_row_order(tasks):
@@ -306,16 +335,19 @@ def renumber_by_row_order(tasks):
         print("   如需序号自动重排，请在多维表格中把「序号」字段类型改为【数字】")
         return tasks
 
-    updated = 0
+    updates = []
+    changes = []
     for i, t in enumerate(tasks):
         expected_seq = i + 1
         current_seq = get_seq(t)
         if current_seq != expected_seq:
-            update_task(t["record_id"], {"序号": expected_seq})
-            updated += 1
+            updates.append((t["record_id"], {"序号": expected_seq}))
+            changes.append(f"{current_seq or '空'}→{expected_seq}")
 
-    if updated > 0:
-        print(f"序号原位重排完成：更新了 {updated} 条（条目位置不变）")
+    if updates:
+        batch_update_records(TASK_TABLE_ID, updates)
+        print(f"序号原位重排完成：批量更新了 {len(updates)} 条（条目位置不变）")
+        print(f"   变化明细: {', '.join(changes)}")
     else:
         print("序号已是连续排列，无需调整")
     return tasks
@@ -483,8 +515,9 @@ def main():
     stale_today = [t for t in all_today if t["record_id"] not in valid_ids]
     if stale_today:
         print(f"⚠️ 发现 {len(stale_today)} 条空记录残留「是否今日」标记，自动清理")
-        for t in stale_today:
-            update_task(t["record_id"], {"是否今日": False})
+        batch_update_records(
+            TASK_TABLE_ID, [(t["record_id"], {"是否今日": False}) for t in stale_today]
+        )
     today_tasks = [t for t in all_today if t["record_id"] in valid_ids]
     print(f"当前待办数: {len(today_tasks)}")
 
@@ -492,8 +525,10 @@ def main():
     if len(today_tasks) > DAILY_COUNT:
         print(f"⚠️ 待办数超过{DAILY_COUNT}条，清理多余的")
         today_tasks.sort(key=get_seq)
-        for t in today_tasks[DAILY_COUNT:]:
-            update_task(t["record_id"], {"是否今日": False})
+        batch_update_records(
+            TASK_TABLE_ID,
+            [(t["record_id"], {"是否今日": False}) for t in today_tasks[DAILY_COUNT:]],
+        )
         today_tasks = today_tasks[:DAILY_COUNT]
 
     # 6. 统计已完成的，移出待办（智能补充：完成几条就补几条）
@@ -504,15 +539,18 @@ def main():
     # 6.1 把完成的任务写入「完成记录」表
     log_completed_tasks(done_tasks)
 
-    for t in done_tasks:
-        update_task(t["record_id"], {"是否今日": False})
+    if done_tasks:
+        batch_update_records(
+            TASK_TABLE_ID, [(t["record_id"], {"是否今日": False}) for t in done_tasks]
+        )
 
     # 7. 一轮完成判定【提前到补充之前】：
     #    所有有效任务都完成 → 清空全部「完成」标记，开启新一轮
     if all(extract_field_value(t["fields"], "完成") is True for t in valid_tasks):
         print("🎉 完成一轮循环，清空所有任务的完成状态，开启新一轮")
-        for t in valid_tasks:
-            update_task(t["record_id"], {"完成": False})
+        batch_update_records(
+            TASK_TABLE_ID, [(t["record_id"], {"完成": False}) for t in valid_tasks]
+        )
         # 重新拉取，确保后续补充逻辑读到的是清空后的状态
         tasks = get_all_tasks_in_order()
         valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
@@ -551,8 +589,9 @@ def main():
             if len(candidates) >= need_to_add:
                 break
         new_tasks = candidates[:need_to_add]
-        for t in new_tasks:
-            update_task(t["record_id"], {"是否今日": True})
+        batch_update_records(
+            TASK_TABLE_ID, [(t["record_id"], {"是否今日": True}) for t in new_tasks]
+        )
         print(f"已补充: {len(new_tasks)}条")
         if len(new_tasks) < need_to_add:
             print(f"⚠️ 未完成的候选任务不足，本次只补了 {len(new_tasks)} 条")
