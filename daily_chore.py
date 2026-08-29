@@ -14,7 +14,13 @@
 - 支持 --check-only 高频检查模式（无新补充时静默退出）
 - 支持 --reset 重置模式：清空所有任务的「是否今日」和「完成」标记，
   然后自动从头补充第1~5条（本地调试用，GitHub 上不需要）
+- 防重复保险：推送成功后会把当天日期写入配置表「上次推送日期」，
+  同一天内再次触发（无论来自哪个闹钟）都直接退出，防止重复推送；
+  如需当天强制重推，把配置表里的日期改乱再运行即可
 - 自动清理空记录上残留的"是否今日"标记
+- 有效任务判定：「小区域」「参考图片」「具体区域描述」任意一个有内容即算有效
+  （仅填「大区域」不算；「序号」「是否今日」「完成」由脚本写入，不参与判定）
+- 推送显示名依次取：小区域 → 具体区域描述 → （见表格参考图片）
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -188,6 +194,35 @@ def get_seq(t):
         return 0
 
 
+def is_valid_task(fields):
+    """
+    有效任务判定：「小区域」「参考图片」「具体区域描述」任意一个有内容即算有效。
+    注意：「序号」「是否今日」「完成」由脚本自己写入，绝不可参与判定，
+    否则脚本写过的行会永远被当成有效任务。
+    """
+    for name in ("小区域", "参考图片", "具体区域描述"):
+        val = fields.get(name)
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        if isinstance(val, list) and not val:
+            continue
+        return True
+    return False
+
+
+def get_task_display_name(fields):
+    """任务显示名：优先小区域，其次具体区域描述，都没有则提示看参考图片"""
+    small = extract_field_value(fields, "小区域")
+    if small:
+        return small
+    desc = extract_field_value(fields, "具体区域描述")
+    if desc:
+        return desc
+    return "（见表格参考图片）"
+
+
 def get_all_tasks_in_order():
     """通过默认视图获取所有任务，返回顺序 = 表格视觉行顺序"""
     return list_records(TASK_TABLE_ID, view_id=DEFAULT_VIEW_ID)
@@ -213,6 +248,22 @@ def update_config(key, value):
             update_record(CONFIG_TABLE_ID, item["record_id"], {"值": str(value)})
             return True
     return False
+
+
+def set_config(key, value):
+    """更新配置项；配置表里还没有这一项时，自动创建该行"""
+    records = list_records(CONFIG_TABLE_ID)
+    for item in records:
+        k = extract_field_value(item["fields"], "配置项")
+        if str(k) == key:
+            update_record(CONFIG_TABLE_ID, item["record_id"], {"值": str(value)})
+            return True
+    result = api_request(
+        "POST",
+        f"/bitable/v1/apps/{BASE_TOKEN}/tables/{CONFIG_TABLE_ID}/records",
+        json_body={"fields": {"配置项": key, "值": str(value)}},
+    )
+    return result.get("code") == 0
 
 
 def update_task(record_id, fields):
@@ -318,12 +369,16 @@ def log_completed_tasks(done_tasks):
 
     records = []
     for t in done_tasks:
+        small = extract_field_value(t["fields"], "小区域")
+        desc = extract_field_value(t["fields"], "具体区域描述")
+        if not small and not desc:
+            small = "（见表格参考图片）"  # 只贴了图片的任务，记录里留个说明
         records.append({
             "fields": {
                 "完成日期": date_ts,
                 "大区域": extract_field_value(t["fields"], "大区域"),
-                "小区域": extract_field_value(t["fields"], "小区域"),
-                "具体区域描述": extract_field_value(t["fields"], "具体区域描述"),
+                "小区域": small,
+                "具体区域描述": desc,
             }
         })
 
@@ -358,8 +413,8 @@ def send_message(task_info):
         lines.append("🆕 新增：")
         for t in new_tasks:
             area = extract_field_value(t["fields"], "大区域")
-            small = extract_field_value(t["fields"], "小区域") or "(未填写)"
-            lines.append(f"  • [{area}] {small}")
+            name = get_task_display_name(t["fields"])
+            lines.append(f"  • [{area}] {name}")
         lines.append("")
 
     remaining_tasks = [t for t in tasks if t["record_id"] not in new_task_ids]
@@ -367,8 +422,8 @@ def send_message(task_info):
         lines.append("🔄 延续（昨日未完成）：")
         for t in remaining_tasks:
             area = extract_field_value(t["fields"], "大区域")
-            small = extract_field_value(t["fields"], "小区域") or "(未填写)"
-            lines.append(f"  • [{area}] {small}")
+            name = get_task_display_name(t["fields"])
+            lines.append(f"  • [{area}] {name}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━")
@@ -387,10 +442,21 @@ def main():
         mode += "+重置"
     print(f"=== 每日家务任务推送（{mode}模式，每天{DAILY_COUNT}条滑动窗口）===")
 
+    # 0. 防重复保险：今天已推送过就直接退出
+    #    （cron-job.org 主闹钟 + GitHub schedule 备用闹钟可能同一天都触发；
+    #    --reset 和 --check-only 模式不受此限制）
+    today_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+    if not check_only and not reset_mode:
+        config = get_config()
+        if config.get("上次推送日期") == today_str:
+            print(f"✅ 今天（{today_str}）已经推送过了，本次跳过")
+            print("   如需强制重推：把配置表「上次推送日期」的值改成别的，再重新运行")
+            return
+
     # 1. 获取所有任务（按默认视图行顺序），过滤空记录
     tasks = get_all_tasks_in_order()
     total = len(tasks)
-    valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+    valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
     print(f"当前任务总数: {total}，有效任务: {len(valid_tasks)}")
 
     if len(valid_tasks) == 0:
@@ -401,13 +467,13 @@ def main():
     if reset_mode:
         reset_all_flags(tasks)
         tasks = get_all_tasks_in_order()
-        valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+        valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
 
     # 3. 每日推送模式：序号原位重排（不移动条目位置，只对有效记录编序号）
     if not check_only:
         renumber_by_row_order(valid_tasks)
         tasks = get_all_tasks_in_order()
-        valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+        valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
 
     # 4. 清理残留 + 统计当前待办
     #    注意：必须在【全部记录】里找「是否今日」=true，
@@ -449,7 +515,7 @@ def main():
             update_task(t["record_id"], {"完成": False})
         # 重新拉取，确保后续补充逻辑读到的是清空后的状态
         tasks = get_all_tasks_in_order()
-        valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+        valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
 
     # 8. 计算需要补充多少条（未完成的一条不补，原样保留到明天）
     need_to_add = DAILY_COUNT - len(remaining_tasks)
@@ -493,7 +559,7 @@ def main():
 
     # 10. 重新获取当前待办，发送消息
     tasks = get_all_tasks_in_order()
-    valid_tasks = [t for t in tasks if extract_field_value(t["fields"], "小区域")]
+    valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
     final_today = [t for t in valid_tasks if extract_field_value(t["fields"], "是否今日") is True]
     final_today.sort(key=get_seq)
 
@@ -514,6 +580,11 @@ def main():
 
     success = send_message(task_info)
     print(f"消息推送: {'成功' if success else '失败'}")
+    if success and not check_only:
+        if set_config("上次推送日期", today_str):
+            print(f"📌 已记录推送日期: {today_str}（今天再触发将自动跳过）")
+        else:
+            print("⚠️ 推送日期写入配置表失败（不影响本次推送）")
     print("=== 执行完成 ===")
 
 
