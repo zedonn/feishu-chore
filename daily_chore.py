@@ -8,16 +8,16 @@
 - 补充时跳过「完成」=true的任务（已完成的这一轮不再回来）
 - 一轮完成判定提前：所有任务都完成时，先清空全部「完成」标记开启新一轮，再补充
 - 序号原位重排：按【Grid View（全部记录）】的行顺序把序号改写成1,2,3...
-  （你经常增删改移动任务，每天重排一次保持编号连续）
 - 显示顺序以「今日任务」视图为准：图和推送消息里任务的排列顺序
-  = 你在该视图里看到的行顺序，所见即所得；找不到该视图则回退为按序号排序
+  = 你在该视图里看到的行顺序；找不到该视图则回退为按序号排序
 - 完成记录：检测到打钩完成的任务时，自动写入「完成记录」表（表不存在则自动创建）
 - 支持 --check-only 高频检查模式（无新补充时静默退出）
 - 支持 --reset 重置模式
 - 防重复保险：推送成功后记录当天日期，同一天再次触发直接退出
-- 墨水屏图片（单任务版）：顶部信息条为 具体描述居左 / 大区域居中偏右加粗 /
-  小区域最右，竖线分隔，超宽截断；下方整块显示该条任务的参考照片
-  （等比居中，不裁剪）；默认显示今日第一条未完成的任务，无照片显示占位文字
+- 墨水屏图片（单任务版）：顶部信息条为 具体描述居左 / 大区域居中 /
+  小区域最右，全部细体，竖线分隔，超宽截断；下方整块显示该条任务的
+  参考照片（等比居中，不裁剪）；显示今日第一条未完成的任务，
+  无照片显示占位文字；无时间戳、无其他多余元素
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -480,13 +480,18 @@ def _truncate(draw, text, font, max_w):
     return text + "…"
 
 
-def _draw_right_in_col(draw, text, font, col_left, col_w, y, fill, bold=False):
-    """列内右对齐绘制文字（超宽先截断）；bold=True 时偏移1像素重复绘制模拟加粗"""
+def _draw_center(draw, text, font, col_left, col_w, y, fill):
+    """列内水平居中绘制文字（超宽先截断）"""
+    text = _truncate(draw, text, font, col_w)
+    x = col_left + (col_w - draw.textlength(text, font=font)) / 2
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _draw_right(draw, text, font, col_left, col_w, y, fill):
+    """列内右对齐绘制文字（超宽先截断）"""
     text = _truncate(draw, text, font, col_w)
     x = col_left + col_w - draw.textlength(text, font=font)
     draw.text((x, y), text, font=font, fill=fill)
-    if bold:
-        draw.text((x + 1, y), text, font=font, fill=fill)
 
 
 def get_task_photo(fields):
@@ -521,8 +526,8 @@ def fit_contain(img, w, h):
 
 
 def render_today_image(today_tasks):
-    """400x300 单任务版：顶部信息条（具体描述|大区域|小区域）+ 下方参考照片大图。
-    显示今日任务里第一条未完成的；无照片显示占位文字。"""
+    """400x300 单任务版：顶部信息条（具体描述居左|大区域居中|小区域居右，全细体）
+    + 下方参考照片大图。显示今日第一条未完成的任务。无时间戳。"""
     from PIL import Image, ImageDraw, ImageFont
 
     font_path = _find_font()
@@ -536,13 +541,10 @@ def render_today_image(today_tasks):
 
     f_info = ImageFont.truetype(font_path, 18, index=index)
     f_ph = ImageFont.truetype(font_path, 20, index=index)
-    f_small = ImageFont.truetype(font_path, 12, index=index)
 
     BLACK = (30, 30, 30)
     GRAY = (150, 150, 150)
     LINE = (190, 190, 190)
-
-    now = datetime.now(BEIJING_TZ)
 
     # 当前任务 = 今日列表里第一条未完成的（全部完成则显示第一条）
     rows = today_tasks[:5]
@@ -559,7 +561,7 @@ def render_today_image(today_tasks):
     x2 = x1 + col_w1
     x3 = x2 + col_w2
 
-    # ---- 顶部信息条 ----
+    # ---- 顶部信息条（全部细体）----
     head_h = 44
     cy = 10
     fields = current["fields"] if current is not None else {}
@@ -573,12 +575,11 @@ def render_today_image(today_tasks):
         draw.text((x1, cy), _truncate(draw, desc, f_info, col_w1 - 8),
                   font=f_info, fill=BLACK)
         if area:
-            _draw_right_in_col(draw, area, f_info, x2, col_w2, cy, BLACK, bold=True)
+            _draw_center(draw, area, f_info, x2, col_w2, cy, BLACK)
         if small:
-            _draw_right_in_col(draw, small, f_info, x3, col_w3, cy, BLACK)
-        shown = desc
+            _draw_right(draw, small, f_info, x3, col_w3, cy, BLACK)
     else:
-        shown = "（无任务）"
+        draw.text((x1, cy), "（无任务）", font=f_info, fill=BLACK)
 
     # 竖分隔线 + 信息条底部横线
     draw.line([x2, 8, x2, head_h - 8], fill=LINE, width=1)
@@ -587,7 +588,7 @@ def render_today_image(today_tasks):
 
     # ---- 下方整块：参考照片（等比居中），无照片显示占位文字 ----
     top = head_h + 2
-    bottom = SCREEN_H - 16
+    bottom = SCREEN_H - 6
     photo = get_task_photo(fields) if current is not None else None
     if photo is not None:
         fit = fit_contain(photo, SCREEN_W - 2 * m, bottom - top)
@@ -600,13 +601,9 @@ def render_today_image(today_tasks):
                    (top + bottom) // 2 - 12),
                   msg, font=f_ph, fill=GRAY)
 
-    # ---- 右下角时间戳（排查趣联缓存用）----
-    ts = "更新于 " + now.strftime("%m-%d %H:%M")
-    draw.text((SCREEN_W - m - draw.textlength(ts, font=f_small), SCREEN_H - 14),
-              ts, font=f_small, fill=GRAY)
-
     os.makedirs(EINK_OUTPUT_DIR, exist_ok=True)
     img.save(EINK_OUTPUT_FILE, "PNG")
+    shown = extract_field_value(fields, "具体区域描述") or extract_field_value(fields, "小区域") or "（无）"
     print(f"🖼️ 已生成墨水屏图片: {EINK_OUTPUT_FILE}（今日{len(today_tasks)}条，屏幕显示: {shown}）")
 
 
@@ -759,10 +756,6 @@ def main():
         "new_task_ids": {t["record_id"] for t in new_tasks},
     }
     print(f"最终待办: {len(final_today)}条（新增{len(new_tasks)}条，延续{len(remaining_tasks)}条）")
-    print("显示顺序: " + " → ".join(
-        f"{i+1}.{extract_field_value(t['fields'], '具体区域描述') or extract_field_value(t['fields'], '小区域') or '（见图）'}"
-        for i, t in enumerate(final_today)
-    ))
 
     # 10.1 渲染墨水屏图片（失败不影响推送）
     try:
