@@ -15,10 +15,10 @@
 - 支持 --reset 重置模式
 - 防重复保险：推送成功后记录当天日期，同一天再次触发直接退出
 - 墨水屏图片（单任务版，极简风格）：紧凑信息栏（约屏幕高度10.7%），
-  三个字段（具体描述居左/大区域居中/小区域居右）完全同字体同字号同字重，
-  仅用细竖线划分区域，底部 1px 横线与照片区分隔；
+  三个字段（具体描述居左/大区域居中/小区域居右）同字体同字号同字重，
+  按字形真实像素边界做垂直居中；细竖线划分区域，底部1px横线与照片区分隔；
   剩余空间全部留给参考照片（等比居中，不裁剪）；
-  显示今日第一条未完成的任务；无照片显示占位文字；无时间戳、无任何装饰元素
+  显示今日第一条未完成的任务；无照片显示占位文字；无时间戳、无装饰元素
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -481,6 +481,16 @@ def _truncate(draw, text, font, max_w):
     return text + "…"
 
 
+def _v_center_y(draw, font, area_top, area_h):
+    """按字形真实像素边界计算垂直居中的绘制 y 坐标。
+    PIL 的 draw.text 以 em 框顶部定位，框内字形上方有预留空隙，
+    直接给 y 会导致文字偏下；用 textbbox 量出实际笔画范围来居中。
+    三列同字体同字号，共用一次测量结果即可保证同一水平线。"""
+    bbox = draw.textbbox((0, 0), "国家", font=font)
+    glyph_h = bbox[3] - bbox[1]
+    return area_top + (area_h - glyph_h) / 2 - bbox[1]
+
+
 def _draw_center(draw, text, font, col_left, col_w, y, fill):
     """列内水平居中绘制文字（超宽先截断）"""
     text = _truncate(draw, text, font, col_w)
@@ -529,8 +539,9 @@ def fit_contain(img, w, h):
 def render_today_image(today_tasks):
     """400x300 单任务版（极简）：
     紧凑信息栏 32px（占屏高10.7%），三字段同字体同字号同字重（18px 细体），
-    具体描述居左/大区域居中/小区域居右，细竖线划分，底部1px横线；
-    剩余空间全部给参考照片（等比居中不裁剪）。显示今日第一条未完成任务。"""
+    水平位置：具体描述居左/大区域居中/小区域居右，垂直位置按字形像素边界居中；
+    细竖线划分，底部1px横线；剩余空间全部给参考照片（等比居中不裁剪）。
+    显示今日第一条未完成任务。"""
     from PIL import Image, ImageDraw, ImageFont
 
     font_path = _find_font()
@@ -567,7 +578,7 @@ def render_today_image(today_tasks):
 
     # ---- 顶部信息栏（32px，紧凑）----
     head_h = 32
-    cy = 7
+    ty = _v_center_y(draw, f_info, 0, head_h)   # 按字形真实边界垂直居中
     fields = current["fields"] if current is not None else {}
     if current is not None:
         desc = extract_field_value(fields, "具体区域描述")
@@ -576,18 +587,20 @@ def render_today_image(today_tasks):
         area = extract_field_value(fields, "大区域")
         small = extract_field_value(fields, "小区域")
 
-        draw.text((x1, cy), _truncate(draw, desc, f_info, col_w1 - 8),
+        draw.text((x1, ty), _truncate(draw, desc, f_info, col_w1 - 8),
                   font=f_info, fill=BLACK)
         if area:
-            _draw_center(draw, area, f_info, x2, col_w2, cy, BLACK)
+            _draw_center(draw, area, f_info, x2, col_w2, ty, BLACK)
         if small:
-            _draw_right(draw, small, f_info, x3, col_w3, cy, BLACK)
+            _draw_right(draw, small, f_info, x3, col_w3, ty, BLACK)
     else:
-        draw.text((x1, cy), "（无任务）", font=f_info, fill=BLACK)
+        draw.text((x1, ty), "（无任务）", font=f_info, fill=BLACK)
 
-    # 细竖线仅划分区域 + 信息栏底部 1px 横线（与照片区分隔）
-    draw.line([x2, 6, x2, head_h - 6], fill=LINE, width=1)
-    draw.line([x3, 6, x3, head_h - 6], fill=LINE, width=1)
+    # 细竖线仅划分区域（与字形垂直范围对齐）+ 信息栏底部 1px 横线
+    line_top = ty + 2
+    line_bot = ty + 22
+    draw.line([x2, line_top, x2, line_bot], fill=LINE, width=1)
+    draw.line([x3, line_top, x3, line_bot], fill=LINE, width=1)
     draw.line([0, head_h, SCREEN_W, head_h], fill=LINE, width=1)
 
     # ---- 照片区：占据剩余全部空间 ----
