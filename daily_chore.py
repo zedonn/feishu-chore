@@ -145,16 +145,37 @@ def find_view_id_by_name(table_id, name):
                 return v.get("view_id")
     return None
 
+
+def extract_field_value(fields, field_name):
+    """从 fields 字典中提取字段值，兼容多种类型（文字字段会返回片段列表）"""
+    val = fields.get(field_name)
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        if not val:
+            return ""
+        if isinstance(val[0], dict):
+            return val[0].get("text", str(val[0]))
+        return str(val[0])
+    if isinstance(val, bool):
+        return val
+    return str(val)
+
 # ============ 配置表读写 ============
 def read_config_all():
-    return {r["fields"].get("配置项"): r for r in list_records(CONFIG_TABLE_ID)}
+    cfg = {}
+    for r in list_records(CONFIG_TABLE_ID):
+        key = extract_field_value(r["fields"], "配置项")
+        if key:
+            cfg[key] = r
+    return cfg
 
 def read_config(cfg, key):
     rec = cfg.get(key)
     if not rec:
         return None
-    val = rec["fields"].get("值")
-    return str(val) if val is not None else None
+    val = extract_field_value(rec["fields"], "值")
+    return val if val != "" else None
 
 def set_config(cfg, key, value):
     rec = cfg.get(key)
@@ -328,13 +349,9 @@ def render_eink_image(task, photo=None):
     """task: {描述, 大区域, 小区域}；photo: PIL Image 或 None"""
     img = Image.new("RGB", (400, 300), (255, 255, 255))
     draw = ImageDraw.Draw(img)
-    desc = (task.get("具体区域描述") or "").strip()
-    big = (task.get("大区域") or "").strip()
-    small = (task.get("小区域") or "").strip()
-    if isinstance(small, list):  # 单选字段返回值可能是 list
-        small = small[0] if small else ""
-    if isinstance(big, list):
-        big = big[0] if big else ""
+    desc = extract_field_value(task, "具体区域描述").strip()
+    big = extract_field_value(task, "大区域").strip()
+    small = extract_field_value(task, "小区域").strip()
     if photo and photo.width < photo.height:
         print(f"版式: 竖图自适应（照片 {photo.width}×{photo.height} → 屏上 {round(photo.width*300/photo.height)}×300）")
         render_portrait(img, draw, desc, big, small, photo)
@@ -355,29 +372,29 @@ def push_photo_to_funnycoo(img):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
+    # 1) 上传新图（成功前绝不动旧图；失败=屏幕继续显示旧图，安全降级）
     try:
         resp = requests.post(f"{FUNNYCOO_BASE}/api/upload-photo",
             files={"file": ("today.png", buf, "image/png")},
             data={"devId": dev_id}, timeout=30)
-        if resp.status_code != 200:
-            print(f"⚠️ funnycoo 上传失败 HTTP {resp.status_code}（屏幕继续显示旧图）")
+        data = resp.json()
+        if not (resp.status_code == 200 and data.get("success")):
+            print(f"⚠️ funnycoo 上传失败 HTTP {resp.status_code} {data}（屏幕继续显示旧图）")
             return False
+        new_id = data["data"]["id"]  # 从上传响应拿到新图ID（验证过的解析路径）
+        print(f"🖼️ 已推送到墨水屏相册: {new_id}")
     except Exception as e:
         print(f"⚠️ funnycoo 上传异常: {e}（屏幕继续显示旧图）")
         return False
-    # 删旧图
+    # 2) 新图就位后，删掉相册里其余旧图（只留新图=固定显示；按ID比对，不猜列表顺序）
     try:
         lst = requests.get(f"{FUNNYCOO_BASE}/api/photo-list/{dev_id}", timeout=15).json()
-        photos = lst.get("photos") or lst.get("data") or []
-        ids = [p.get("id") for p in photos if p.get("id")]
-        if len(ids) > 1:
-            keep = ids[-1]  # 刚传的在最后
-            for pid in ids[:-1]:
-                requests.delete(f"{FUNNYCOO_BASE}/api/delete-photo/{dev_id}/{pid}", timeout=15)
-            print(f"已清理旧图 {len(ids)-1} 张，相册仅保留最新")
+        for p in lst.get("data", []):
+            if p.get("id") and p.get("id") != new_id:
+                requests.delete(f"{FUNNYCOO_BASE}/api/delete-photo/{dev_id}/{p['id']}", timeout=15)
+                print(f"   🗑️ 已删除相册旧图: {p.get('name', p['id'])}")
     except Exception as e:
-        print(f"⚠️ 清理旧图异常（不影响显示）: {e}")
-    print("✅ 已推送到墨水屏相册")
+        print(f"⚠️ 清理旧图异常（新图不受影响，最多新旧图随机轮播）: {e}")
     return True
 
 # ============ 渲染预览（验收用） ============
@@ -414,18 +431,18 @@ def run_preview(mode):
 
 # ============ 主流程 ============
 def is_valid_task(f):
-    def nonempty(v):
-        if isinstance(v, list):
-            return any(str(x).strip() for x in v)
-        return bool(str(v or "").strip())
-    return nonempty(f.get("小区域")) or nonempty(f.get("参考图片")) or nonempty(f.get("具体区域描述"))
+    """有效任务判定：「小区域」「参考图片」「具体区域描述」任意一个有内容即算有效"""
+    if f.get("参考图片"):  # 附件字段：非空列表即有效
+        return True
+    return bool(extract_field_value(f, "小区域").strip()
+                or extract_field_value(f, "具体区域描述").strip())
 
 def task_name(f):
-    small = f.get("小区域")
-    if isinstance(small, list):
-        small = small[0] if small else ""
-    desc = f.get("具体区域描述") or ""
-    return f"{small}（{desc}）" if desc else str(small or "")
+    small = extract_field_value(f, "小区域")
+    desc = extract_field_value(f, "具体区域描述")
+    if small:
+        return f"{small}（{desc}）" if desc else small
+    return desc or "（见表格参考图片）"
 
 def beijing_today():
     return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
@@ -623,7 +640,7 @@ def ensure_log_table_and_write(done_records):
             "完成日期": midnight,
             "大区域": str(big or ""),
             "小区域": str(small or ""),
-            "具体区域描述": str(f.get("具体区域描述") or ""),
+            "具体区域描述": extract_field_value(f, "具体区域描述"),
         }})
     if new_records:
         api_request("POST",
