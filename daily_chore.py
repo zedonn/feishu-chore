@@ -10,7 +10,8 @@
   描述1~3行 → 线 → 大区域 → 线 → 小区域 → 线；
   进度块锚底：电池=列宽×20px（y274~294，底距6px）→ 年份行(y250) → 家务行(y226)；
   年份超列宽自动折2行(y226+y250)，家务行上移至y202（2行封顶）。
-电池 = 1px墨色边框 + 2px内衬，灰色(#969696)实心填充=精确百分比，无凸起。
+电池 = 1px墨色边框 + 2px内衬，灰色(#969696)实心填充，无凸起。
+【绑定关系（原型锁定，勿动）】电池填充 = 年份进度；家务%为纯文字，无条。
 
 家务进度口径（v7.2，用户定稿·全表轮次）：完成✔数 ÷ 有效任务总数。
   每次渲染前现查任务表（所有写操作之后），勾一个涨一档；
@@ -20,7 +21,7 @@
 渲染预览（验收用，不碰真实数据）：
 系统配置表加一行「渲染预览」，值 = 竖 / 竖短 / 竖方 / 横 → 跑 workflow 会用示例数据
 渲染对应版式并推到屏幕，不发飞书消息、不动任务字段，跑完自动把值改回「否」。
-预览固定示例值：家务 60% / 今年已过 67%。
+预览固定示例值：家务 60%（纯文字）/ 今年已过 67%（电池约2/3满）。
 值 = 否 或无此行 = 正常模式。
 
 环境变量（必填）：LARK_APP_ID / LARK_APP_SECRET（GitHub Secrets）
@@ -296,6 +297,7 @@ def _hline(draw, x1, x2, y):
 
 def _draw_battery(draw, x, y, w, h, pct):
     """v7 电池进度条：1px 墨色边框 + 2px 内衬，灰色实心填充=精确百分比，无凸起
+    调用约定（原型锁定）：本函数只用于年份进度电池；家务%为纯文字，不配条
     pct=0 时为空电池（设计内行为：0% 本来就无填充）"""
     draw.rectangle([x, y, x + w - 1, y + h - 1], outline=INK, fill=(255, 255, 255))
     inner_w = w - 6
@@ -348,11 +350,11 @@ def render_landscape(img, draw, desc, big, small, photo, chore_pct=0, year_pct=0
     # ---- v7 底部进度行（y268 横线，行槽 y269~299）----
     _hline(draw, 0, 400, 268)
     batt_w, batt_h = 110, 20
-    _draw_battery(draw, 394 - batt_w, 274, batt_w, batt_h, chore_pct)
+    _draw_battery(draw, 394 - batt_w, 274, batt_w, batt_h, year_pct)  # 电池=年份进度（原型锁定）
     year_text = f"{datetime.now(BEIJING_TZ).year}年已过{year_pct}%"
     tx = 394 - batt_w - 8 - FONT.getlength(year_text)
     _draw_row(draw, tx, 269, 214, year_text, FONT, row_h=30)
-    _draw_row(draw, 6, 269, 214, f"家务 {chore_pct}%", FONT, row_h=30)
+    _draw_row(draw, 6, 269, 214, f"家务 {chore_pct}%", FONT, row_h=30)  # 家务纯文字，无条
 
 
 def _info_y(_):
@@ -386,7 +388,7 @@ def render_portrait(img, draw, desc, big, small, photo, chore_pct=0, year_pct=0)
             y += 24
     _hline(draw, col_left, col_right, y)
     # ---- v7 进度块（锚底：电池钉 y274~294 底距6px；年份超宽折2行则家务行上移）----
-    _draw_battery(draw, col_left, 274, col_w, 20, chore_pct)
+    _draw_battery(draw, col_left, 274, col_w, 20, year_pct)  # 电池=年份进度（原型锁定）
     year_text = f"{datetime.now(BEIJING_TZ).year}年已过{year_pct}%"
     if FONT.getlength(year_text) <= col_w:
         _draw_row(draw, col_left, 250, col_w, year_text, FONT)
@@ -397,12 +399,13 @@ def render_portrait(img, draw, desc, big, small, photo, chore_pct=0, year_pct=0)
         if len(lines) > 1:
             _draw_row(draw, col_left, 250, col_w, lines[1], FONT)
         chore_y = 202
-    _draw_row(draw, col_left, chore_y, col_w, f"家务 {chore_pct}%", FONT)
+    _draw_row(draw, col_left, chore_y, col_w, f"家务 {chore_pct}%", FONT)  # 家务纯文字，无条
 
 
 def render_eink_image(task, photo=None, chore_pct=0, year_pct=None):
     """task: {描述, 大区域, 小区域}；photo: PIL Image 或 None
-    chore_pct: 家务完成百分比(0~100)；year_pct: 今年已过百分比，None=按实时日期计算"""
+    chore_pct: 家务完成百分比(0~100，纯文字显示)；
+    year_pct: 今年已过百分比（电池填充），None=按实时日期计算"""
     if year_pct is None:
         year_pct = _year_elapsed_pct()
     img = Image.new("RGB", (400, 300), (255, 255, 255))
@@ -657,7 +660,7 @@ def picked_any(todo, done_today, lack):
 
 def refresh_eink_only():
     """防重复触发时：只刷新墨水屏图，不发消息。
-    v7.2：进度与主流程同口径（global_chore_progress 现查全表），无需反查补丁"""
+    v7.2：进度与主流程同口径（global_chore_progress 现查全表）"""
     records = list_records(TASK_TABLE_ID, DEFAULT_VIEW_ID)
     todo = [r for r in records if is_valid_task(r["fields"]) and r["fields"].get("是否今日")]
     today_view_id = find_view_id_by_name(TASK_TABLE_ID, TODAY_VIEW_NAME)
