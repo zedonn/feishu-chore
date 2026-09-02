@@ -11,7 +11,11 @@
   进度块锚底：电池=列宽×20px（y274~294，底距6px）→ 年份行(y250) → 家务行(y226)；
   年份超列宽自动折2行(y226+y250)，家务行上移至y202（2行封顶）。
 电池 = 1px墨色边框 + 2px内衬，灰色(#969696)实心填充=精确百分比，无凸起。
-进度口径 =「是否今日」任务中已完成占比（按本次运行时表格状态）。
+
+家务进度口径（v7.2，用户定稿·全表轮次）：完成✔数 ÷ 有效任务总数。
+  每次渲染前现查任务表（所有写操作之后），勾一个涨一档；
+  一轮全部完成 → 系统清空全部✔ → 回到 0% 开新轮。
+年份% = 北京时间实时计算：(现在 - 1月1日0点) ÷ 全年秒数，每天自动上涨。
 
 渲染预览（验收用，不碰真实数据）：
 系统配置表加一行「渲染预览」，值 = 竖 / 竖短 / 竖方 / 横 → 跑 workflow 会用示例数据
@@ -262,7 +266,7 @@ def _truncate(text, font, max_w):
 
 
 def _wrap_break_all(text, font, max_w, max_lines):
-    """逐字换行，最多 max_lines 行，超出直接丢弃（word-break:break-all 等效）"""
+    """逐字换行，最多 max_lines 行，超出直接丢弃（word-break:break_all 等效）"""
     lines, cur = [], ""
     for ch in text:
         if cur and font.getlength(cur + ch) > max_w:
@@ -291,7 +295,8 @@ def _hline(draw, x1, x2, y):
 
 
 def _draw_battery(draw, x, y, w, h, pct):
-    """v7 电池进度条：1px 墨色边框 + 2px 内衬，灰色实心填充=精确百分比，无凸起"""
+    """v7 电池进度条：1px 墨色边框 + 2px 内衬，灰色实心填充=精确百分比，无凸起
+    pct=0 时为空电池（设计内行为：0% 本来就无填充）"""
     draw.rectangle([x, y, x + w - 1, y + h - 1], outline=INK, fill=(255, 255, 255))
     inner_w = w - 6
     fw = min(inner_w, max(0, round(inner_w * pct / 100)))
@@ -300,7 +305,7 @@ def _draw_battery(draw, x, y, w, h, pct):
 
 
 def _year_elapsed_pct():
-    """今年已过百分比（北京时间，按秒计算后取整）"""
+    """今年已过百分比（北京时间，按秒计算后取整；每天自动上涨约0.27%）"""
     now = datetime.now(BEIJING_TZ)
     start = datetime(now.year, 1, 1, tzinfo=BEIJING_TZ)
     end = datetime(now.year + 1, 1, 1, tzinfo=BEIJING_TZ)
@@ -338,7 +343,7 @@ def render_landscape(img, draw, desc, big, small, photo, chore_pct=0, year_pct=0
         ph = "这里是图片"
         w = FONT_PLACEHOLDER.getlength(ph)
         bbox = FONT_PLACEHOLDER.getbbox(ph)
-        ty = 34 + 115 - (bbox[3] - bbox[1]) / 2 - bbox[1]  # v7: 中心 131→115
+        ty = 34 + 115 - (bbox[3] - bbox[1]) / 2 - bbox[1]
         draw.text(((400 - w) / 2, ty), ph, font=FONT_PLACEHOLDER, fill=PLACEHOLDER)
     # ---- v7 底部进度行（y268 横线，行槽 y269~299）----
     _hline(draw, 0, 400, 268)
@@ -435,7 +440,7 @@ def push_photo_to_funnycoo(img):
         if not (resp.status_code == 200 and data.get("success")):
             print(f"⚠️ funnycoo 上传失败 HTTP {resp.status_code} {data}（屏幕继续显示旧图）")
             return False
-        new_id = data["data"]["id"]  # 从上传响应拿到新图ID（验证过的解析路径）
+        new_id = data["data"]["id"]
         print(f"🖼️ 已推送到墨水屏相册: {new_id}")
     except Exception as e:
         print(f"⚠️ funnycoo 上传异常: {e}（屏幕继续显示旧图）")
@@ -450,6 +455,20 @@ def push_photo_to_funnycoo(img):
     except Exception as e:
         print(f"⚠️ 清理旧图异常（新图不受影响，最多新旧图随机轮播）: {e}")
     return True
+
+
+# ============ 家务进度（v7.2 全表轮次口径） ============
+def global_chore_progress():
+    """完成✔数 ÷ 有效任务总数。渲染前现查任务表（此时主流程写操作均已完成）：
+    勾一个涨一档；一轮全勾 → 清空✔后查询 → 0% 开新轮。
+    返回 (完成数, 总数, 百分比)"""
+    records = list_records(TASK_TABLE_ID)
+    valid = [r for r in records if is_valid_task(r["fields"])]
+    n_total = len(valid)
+    n_done = sum(1 for r in valid if r["fields"].get("完成"))
+    pct = round(n_done * 100 / n_total) if n_total else 0
+    print(f"本轮进度: {n_done}/{n_total} · {pct}%")
+    return n_done, n_total, pct
 
 
 # ============ 渲染预览（验收用） ============
@@ -526,7 +545,7 @@ def main():
     if "--reset" not in args and "--check-only" not in args:
         if read_config(cfg, "上次推送日期") == beijing_today():
             print("今天已推送过（防重复保险），仅刷新墨水屏图片")
-            refresh_eink_only(args)
+            refresh_eink_only()
             return
 
     print("===== 拉取任务数据 =====")
@@ -558,7 +577,7 @@ def main():
     if done_today:
         ensure_log_table_and_write(done_today)
 
-    # 一轮判定提前：全部完成 → 清空「完成」→ 重新拉取
+    # 一轮判定提前：全部完成 → 清空「完成」→ 重新拉取（清空后 global_chore_progress 自然回到 0%）
     if todo and len(done_today) == len(todo):
         print("一轮全部完成，清空「完成」标记开启新一轮")
         clear_updates = [(r["record_id"], {"完成": False}) for r in valid if r["fields"].get("完成")]
@@ -619,7 +638,7 @@ def main():
         print("check-only：无变化，静默退出")
         return
 
-    # ---- 渲染 + 推墨水屏 ----
+    # ---- 渲染 + 推墨水屏（进度在渲染前按全表现查，v7.2 口径）----
     refresh_eink_display(todo)
 
     # ---- 飞书推送 ----
@@ -636,8 +655,9 @@ def picked_any(todo, done_today, lack):
     return lack > 0 or done_today
 
 
-def refresh_eink_only(args):
-    """防重复触发时：只刷新墨水屏图，不发消息"""
+def refresh_eink_only():
+    """防重复触发时：只刷新墨水屏图，不发消息。
+    v7.2：进度与主流程同口径（global_chore_progress 现查全表），无需反查补丁"""
     records = list_records(TASK_TABLE_ID, DEFAULT_VIEW_ID)
     todo = [r for r in records if is_valid_task(r["fields"]) and r["fields"].get("是否今日")]
     today_view_id = find_view_id_by_name(TASK_TABLE_ID, TODAY_VIEW_NAME)
@@ -648,11 +668,7 @@ def refresh_eink_only(args):
 
 
 def refresh_eink_display(todo):
-    # v7 进度口径：「是否今日」任务中已完成占比（按本次运行时表格状态）
-    n_total = len(todo)
-    n_done = sum(1 for r in todo if r["fields"].get("完成"))
-    chore_pct = round(n_done * 100 / n_total) if n_total else 0
-    print(f"本轮进度: {n_done}/{n_total} · {chore_pct}%")
+    _, _, chore_pct = global_chore_progress()
     target = None
     for r in todo:
         if not r["fields"].get("完成"):
@@ -661,7 +677,7 @@ def refresh_eink_display(todo):
     if not target and todo:
         target = todo[0]
     if not target:
-        img = render_eink_image({"具体区域描述": "（无任务）", "大区域": "", "小区域": ""}, None, 0)
+        img = render_eink_image({"具体区域描述": "（无任务）", "大区域": "", "小区域": ""}, None, chore_pct)
     else:
         photo = fetch_photo(target["fields"])
         img = render_eink_image(target["fields"], photo, chore_pct)
@@ -670,14 +686,17 @@ def refresh_eink_display(todo):
     push_photo_to_funnycoo(img)
 
 
-def ensure_log_table_and_write(done_records):
+def _find_table_id_by_name(name):
     result = api_request("POST", f"/bitable/v1/apps/{BASE_TOKEN}/tables/search", json_body={})
-    log_table_id = None
     if result.get("code") == 0:
         for t in result.get("data", {}).get("items", []):
-            if t.get("name") == LOG_TABLE_NAME:
-                log_table_id = t.get("table_id")
-                break
+            if t.get("name") == name:
+                return t.get("table_id")
+    return None
+
+
+def ensure_log_table_and_write(done_records):
+    log_table_id = _find_table_id_by_name(LOG_TABLE_NAME)
     if not log_table_id:
         r = api_request("POST", f"/bitable/v1/apps/{BASE_TOKEN}/tables",
                         json_body={"table": {"name": LOG_TABLE_NAME, "default_view_name": "记录",
