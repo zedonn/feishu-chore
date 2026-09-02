@@ -14,10 +14,11 @@
 - 支持 --check-only 高频检查模式（无新补充时静默退出）
 - 支持 --reset 重置模式
 - 防重复保险：推送成功后记录当天日期，同一天再次触发直接退出
-- 墨水屏图片（单任务版）：顶部信息条为 具体描述居左 / 大区域居中 /
-  小区域最右，全部细体，竖线分隔，超宽截断；下方整块显示该条任务的
-  参考照片（等比居中，不裁剪）；显示今日第一条未完成的任务，
-  无照片显示占位文字；无时间戳、无其他多余元素
+- 墨水屏图片（单任务版，极简风格）：紧凑信息栏（约屏幕高度10.7%），
+  三个字段（具体描述居左/大区域居中/小区域居右）完全同字体同字号同字重，
+  仅用细竖线划分区域，底部 1px 横线与照片区分隔；
+  剩余空间全部留给参考照片（等比居中，不裁剪）；
+  显示今日第一条未完成的任务；无照片显示占位文字；无时间戳、无任何装饰元素
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -450,7 +451,7 @@ def send_message(task_info):
     return send_text_message(USER_OPEN_ID, "\n".join(lines))
 
 
-# ============ 墨水屏图片渲染（单任务版：信息条 + 参考照片大图） ============
+# ============ 墨水屏图片渲染（单任务版：紧凑信息栏 + 照片最大化） ============
 
 SCREEN_W, SCREEN_H = 400, 300
 EINK_OUTPUT_DIR = "docs"
@@ -526,8 +527,10 @@ def fit_contain(img, w, h):
 
 
 def render_today_image(today_tasks):
-    """400x300 单任务版：顶部信息条（具体描述居左|大区域居中|小区域居右，全细体）
-    + 下方参考照片大图。显示今日第一条未完成的任务。无时间戳。"""
+    """400x300 单任务版（极简）：
+    紧凑信息栏 32px（占屏高10.7%），三字段同字体同字号同字重（18px 细体），
+    具体描述居左/大区域居中/小区域居右，细竖线划分，底部1px横线；
+    剩余空间全部给参考照片（等比居中不裁剪）。显示今日第一条未完成任务。"""
     from PIL import Image, ImageDraw, ImageFont
 
     font_path = _find_font()
@@ -539,6 +542,7 @@ def render_today_image(today_tasks):
     img = Image.new("RGB", (SCREEN_W, SCREEN_H), "white")
     draw = ImageDraw.Draw(img)
 
+    # 三字段完全一致：同字体文件、同字号、同字重（Regular 细体）
     f_info = ImageFont.truetype(font_path, 18, index=index)
     f_ph = ImageFont.truetype(font_path, 20, index=index)
 
@@ -552,7 +556,7 @@ def render_today_image(today_tasks):
                     if extract_field_value(t["fields"], "完成") is not True),
                    rows[0] if rows else None)
 
-    # ---- 三栏几何（按原型图比例 约55% / 24% / 20%，竖线分隔）----
+    # ---- 三栏几何 ----
     m = 6
     col_w1 = 214   # 具体描述
     col_w2 = 96    # 大区域
@@ -561,9 +565,9 @@ def render_today_image(today_tasks):
     x2 = x1 + col_w1
     x3 = x2 + col_w2
 
-    # ---- 顶部信息条（全部细体）----
-    head_h = 44
-    cy = 10
+    # ---- 顶部信息栏（32px，紧凑）----
+    head_h = 32
+    cy = 7
     fields = current["fields"] if current is not None else {}
     if current is not None:
         desc = extract_field_value(fields, "具体区域描述")
@@ -581,14 +585,14 @@ def render_today_image(today_tasks):
     else:
         draw.text((x1, cy), "（无任务）", font=f_info, fill=BLACK)
 
-    # 竖分隔线 + 信息条底部横线
-    draw.line([x2, 8, x2, head_h - 8], fill=LINE, width=1)
-    draw.line([x3, 8, x3, head_h - 8], fill=LINE, width=1)
+    # 细竖线仅划分区域 + 信息栏底部 1px 横线（与照片区分隔）
+    draw.line([x2, 6, x2, head_h - 6], fill=LINE, width=1)
+    draw.line([x3, 6, x3, head_h - 6], fill=LINE, width=1)
     draw.line([0, head_h, SCREEN_W, head_h], fill=LINE, width=1)
 
-    # ---- 下方整块：参考照片（等比居中），无照片显示占位文字 ----
+    # ---- 照片区：占据剩余全部空间 ----
     top = head_h + 2
-    bottom = SCREEN_H - 6
+    bottom = SCREEN_H - 4
     photo = get_task_photo(fields) if current is not None else None
     if photo is not None:
         fit = fit_contain(photo, SCREEN_W - 2 * m, bottom - top)
@@ -596,7 +600,7 @@ def render_today_image(today_tasks):
         py = top + (bottom - top - fit.height) // 2
         img.paste(fit, (px, py))
     else:
-        msg = "无参考照片" if current is not None else "今天没有待办任务，好好休息！"
+        msg = "这里是图片" if current is not None else "今天没有待办任务"
         draw.text(((SCREEN_W - draw.textlength(msg, font=f_ph)) // 2,
                    (top + bottom) // 2 - 12),
                   msg, font=f_ph, fill=GRAY)
