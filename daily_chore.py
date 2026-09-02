@@ -15,9 +15,9 @@
 - 支持 --reset 重置模式
 - 防重复保险：推送成功后记录当天日期，同一天再次触发直接退出
 - 墨水屏图片（单任务版，极简风格）：紧凑信息栏（约屏幕高度10.7%），
-  三个字段（具体描述居左/大区域居中/小区域居右）同字体同字号同字重，
-  按字形真实像素边界做垂直居中；细竖线划分区域，底部1px横线与照片区分隔；
-  剩余空间全部留给参考照片（等比居中，不裁剪）；
+  三个字段（具体描述居左/大区域居中/小区域居右）同字体同字号同字重；
+  文字与竖线共用同一条几何中线（按字形真实墨迹边界校准），
+  底部1px横线与照片区分隔；剩余空间全部留给参考照片（等比居中，不裁剪）；
   显示今日第一条未完成的任务；无照片显示占位文字；无时间戳、无装饰元素
 
 环境变量（必填）：
@@ -481,16 +481,6 @@ def _truncate(draw, text, font, max_w):
     return text + "…"
 
 
-def _v_center_y(draw, font, area_top, area_h):
-    """按字形真实像素边界计算垂直居中的绘制 y 坐标。
-    PIL 的 draw.text 以 em 框顶部定位，框内字形上方有预留空隙，
-    直接给 y 会导致文字偏下；用 textbbox 量出实际笔画范围来居中。
-    三列同字体同字号，共用一次测量结果即可保证同一水平线。"""
-    bbox = draw.textbbox((0, 0), "国家", font=font)
-    glyph_h = bbox[3] - bbox[1]
-    return area_top + (area_h - glyph_h) / 2 - bbox[1]
-
-
 def _draw_center(draw, text, font, col_left, col_w, y, fill):
     """列内水平居中绘制文字（超宽先截断）"""
     text = _truncate(draw, text, font, col_w)
@@ -538,9 +528,10 @@ def fit_contain(img, w, h):
 
 def render_today_image(today_tasks):
     """400x300 单任务版（极简）：
-    紧凑信息栏 32px（占屏高10.7%），三字段同字体同字号同字重（18px 细体），
-    水平位置：具体描述居左/大区域居中/小区域居右，垂直位置按字形像素边界居中；
-    细竖线划分，底部1px横线；剩余空间全部给参考照片（等比居中不裁剪）。
+    紧凑信息栏 32px，三字段同字体同字号同字重（18px 细体）；
+    文字与竖线共用同一条几何中线：先按字形真实墨迹边界把文字对齐到中线，
+    竖线再以同一条中线对称画出，两者数学上严格平齐；
+    底部1px横线；剩余空间全部给参考照片（等比居中不裁剪）。
     显示今日第一条未完成任务。"""
     from PIL import Image, ImageDraw, ImageFont
 
@@ -578,7 +569,19 @@ def render_today_image(today_tasks):
 
     # ---- 顶部信息栏（32px，紧凑）----
     head_h = 32
-    ty = _v_center_y(draw, f_info, 0, head_h)   # 按字形真实边界垂直居中
+    mid = head_h / 2.0    # 信息栏几何中线 = 16px，文字和竖线都以它为准
+
+    # 按字形真实墨迹边界计算绘制 y：使墨迹中心精确落在 mid
+    # （PIL 的 y 是 em 框顶部，框内字形上方有空隙，必须用 textbbox 校准）
+    ref_bbox = draw.textbbox((0, 0), "国家", font=f_info)
+    ty = mid - (ref_bbox[1] + ref_bbox[3]) / 2
+    ink_top = ty + ref_bbox[1]
+    ink_bot = ty + ref_bbox[3]
+
+    # 竖线以同一条 mid 为中心对称画出（不再跟随文字 y 做硬编码偏移）
+    line_top = round(mid - 10)
+    line_bot = round(mid + 10)
+
     fields = current["fields"] if current is not None else {}
     if current is not None:
         desc = extract_field_value(fields, "具体区域描述")
@@ -596,9 +599,7 @@ def render_today_image(today_tasks):
     else:
         draw.text((x1, ty), "（无任务）", font=f_info, fill=BLACK)
 
-    # 细竖线仅划分区域（与字形垂直范围对齐）+ 信息栏底部 1px 横线
-    line_top = ty + 2
-    line_bot = ty + 22
+    # 细竖线划分区域 + 信息栏底部 1px 横线（与照片区分隔）
     draw.line([x2, line_top, x2, line_bot], fill=LINE, width=1)
     draw.line([x3, line_top, x3, line_bot], fill=LINE, width=1)
     draw.line([0, head_h, SCREEN_W, head_h], fill=LINE, width=1)
@@ -620,6 +621,9 @@ def render_today_image(today_tasks):
 
     os.makedirs(EINK_OUTPUT_DIR, exist_ok=True)
     img.save(EINK_OUTPUT_FILE, "PNG")
+    # 校准数据打到日志（不进图）：文字墨迹中心应等于竖线中心 = 16
+    print(f"   信息栏校准: 中线={mid:.0f}px, 文字墨迹 {ink_top:.1f}~{ink_bot:.1f}px"
+          f"（中心 {(ink_top + ink_bot) / 2:.1f}）, 竖线 {line_top}~{line_bot}px（中心 {mid:.0f}）")
     shown = extract_field_value(fields, "具体区域描述") or extract_field_value(fields, "小区域") or "（无）"
     print(f"🖼️ 已生成墨水屏图片: {EINK_OUTPUT_FILE}（今日{len(today_tasks)}条，屏幕显示: {shown}）")
 
