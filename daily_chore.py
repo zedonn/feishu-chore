@@ -17,9 +17,8 @@
 - 墨水屏图片（单任务版，极简风格）：紧凑信息栏（约屏幕高度10.7%），
   三个字段（具体描述居左/大区域居中/小区域居右）同字体同字号同字重；
   文字与竖线共用同一条几何中线（按字形真实墨迹边界校准），
-  底部1px横线与照片区分隔；照片 cover 铺满裁切（填满优先）；
-  渲染后自动推送到 funnycoo 相册（设备走照片轮播主题显示）
-- 飞书推送优先用配置表「飞书邮箱」当收件人（邮箱跟人走，换应用不失效）
+  底部1px横线与照片区分隔；剩余空间全部留给参考照片（等比居中，不裁剪）；
+  显示今日第一条未完成的任务；无照片显示占位文字；无时间戳、无装饰元素
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
@@ -31,7 +30,7 @@
   LARK_CONFIG_TABLE_ID     系统配置表 ID
   LARK_DEFAULT_VIEW_ID     默认视图 ID（Grid View，序号重排和任务池扫描用）
   LARK_TODAY_VIEW_NAME     今日视图名字（显示顺序以它为准），默认「今日任务」
-  LARK_USER_OPEN_ID        推送目标用户的 open_id（无「飞书邮箱」时的回退）
+  LARK_USER_OPEN_ID        推送目标用户的 open_id
   CHORE_DAILY_COUNT        每天待办数量，默认5
 """
 
@@ -463,7 +462,7 @@ def send_message(task_info):
     return send_text_message(USER_OPEN_ID, "\n".join(lines))
 
 
-# ============ 墨水屏图片渲染（单任务版：紧凑信息栏 + 照片铺满） ============
+# ============ 墨水屏图片渲染（单任务版：紧凑信息栏 + 照片最大化） ============
 
 SCREEN_W, SCREEN_H = 400, 300
 EINK_OUTPUT_DIR = "docs"
@@ -528,15 +527,12 @@ def get_task_photo(fields):
         return None
 
 
-def fit_cover(img, w, h):
-    """等比缩放并居中裁剪，铺满 w×h（填满优先：竖屏照片裁上下，横屏裁左右）"""
-    ratio = max(w / img.width, h / img.height)
+def fit_contain(img, w, h):
+    """等比缩放图片至完整放入 w×h（不裁剪不变形），返回 RGB 图"""
+    ratio = min(w / img.width, h / img.height)
     nw = max(1, round(img.width * ratio))
     nh = max(1, round(img.height * ratio))
-    img = img.resize((nw, nh))
-    left = (nw - w) // 2
-    top = (nh - h) // 2
-    return img.crop((left, top, left + w, top + h)).convert("RGB")
+    return img.resize((nw, nh)).convert("RGB")
 
 
 def render_today_image(today_tasks):
@@ -544,7 +540,7 @@ def render_today_image(today_tasks):
     紧凑信息栏 32px，三字段同字体同字号同字重（18px 细体）；
     文字与竖线共用同一条几何中线：先按字形真实墨迹边界把文字对齐到中线，
     竖线再以同一条中线对称画出，两者数学上严格平齐；
-    底部1px横线；剩余空间全部给参考照片（cover 铺满裁切）。
+    底部1px横线；剩余空间全部给参考照片（等比居中不裁剪）。
     显示今日第一条未完成任务。"""
     from PIL import Image, ImageDraw, ImageFont
 
@@ -617,12 +613,15 @@ def render_today_image(today_tasks):
     draw.line([x3, line_top, x3, line_bot], fill=LINE, width=1)
     draw.line([0, head_h, SCREEN_W, head_h], fill=LINE, width=1)
 
-    # ---- 照片区：占据剩余全部空间（cover 铺满） ----
+    # ---- 照片区：占据剩余全部空间 ----
     top = head_h + 2
     bottom = SCREEN_H - 4
     photo = get_task_photo(fields) if current is not None else None
     if photo is not None:
-        img.paste(fit_cover(photo, SCREEN_W - 2 * m, bottom - top), (m, top))
+        fit = fit_contain(photo, SCREEN_W - 2 * m, bottom - top)
+        px = m + (SCREEN_W - 2 * m - fit.width) // 2
+        py = top + (bottom - top - fit.height) // 2
+        img.paste(fit, (px, py))
     else:
         msg = "这里是图片" if current is not None else "今天没有待办任务"
         draw.text(((SCREEN_W - draw.textlength(msg, font=f_ph)) // 2,
