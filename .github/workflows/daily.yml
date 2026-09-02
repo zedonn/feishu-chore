@@ -2,8 +2,11 @@ name: 每日家务任务推送
 
 on:
   schedule:
-    - cron: "7 20 * * *"   # 北京时间 4:07（UTC 20:07，注意UTC日期是前一天，这是正常的）
+    - cron: "7 20 * * *"  # 北京时间 4:07（UTC 20:07，注意UTC日期是前一天，这是正常的）
   workflow_dispatch:
+
+permissions:
+  contents: write  # 允许 Actions 把生成的图片提交回仓库
 
 jobs:
   daily-push:
@@ -15,10 +18,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install requests
+      - run: pip install requests pillow
 
-      - name: 执行每日推送
+      - name: 执行每日推送 + 生成墨水屏图片
         env:
           LARK_APP_ID: ${{ secrets.LARK_APP_ID }}
           LARK_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
         run: python daily_chore.py
+
+      - name: 提交图片到仓库（GitHub Pages 从 docs 文件夹对外展示）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -f docs/today.png ]; then
+            git add docs/today.png
+            if git diff --cached --quiet; then
+              echo "图片无变化，无需提交"
+            else
+              git commit -m "更新今日任务图片 $(TZ=Asia/Shanghai date +%Y-%m-%d)"
+              git push
+            fi
+          else
+            echo "本次运行没有生成新图片，跳过提交"
+          fi
