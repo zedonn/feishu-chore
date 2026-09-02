@@ -628,6 +628,69 @@ def render_today_image(today_tasks):
     print(f"🖼️ 已生成墨水屏图片: {EINK_OUTPUT_FILE}（今日{len(today_tasks)}条，屏幕显示: {shown}）")
 
 
+# ===== 墨水屏：把渲染好的图推送到 funnycoo 相册 =====
+# （替代 GitHub Pages 中转方案——github.io 在国内被 DNS 污染，funnycoo 抓取不可靠）
+FUNNYCOO_BASE = "https://funnycoo.cn:4001"
+
+
+def get_funnycoo_devid():
+    """从系统配置表读「墨水屏设备ID」。
+    不写死在代码里：仓库是公开的，而这个上传接口只凭设备ID就能调，
+    泄露=任何人都能往你屏幕传图。配置表在飞书里，只有你能看到。"""
+    try:
+        return str(get_config().get("墨水屏设备ID", "")).strip()
+    except Exception:
+        return ""
+
+
+def push_photo_to_funnycoo(png_path):
+    """把图片推到 funnycoo 相册：先传新图，成功后再删掉相册里其余旧图。
+    所有失败都只打印警告，绝不影响飞书推送主流程。"""
+    devid = get_funnycoo_devid()
+    if not devid:
+        print("⚠️ 配置表缺少「墨水屏设备ID」，跳过墨水屏推送")
+        print("   加法：系统配置表加一行 → 配置项=墨水屏设备ID，值=你的设备ID（如 COOIOT_XXXXXX）")
+        return
+    if not os.path.exists(png_path):
+        print(f"⚠️ 图片文件不存在，跳过墨水屏推送: {png_path}")
+        return
+    # 1) 上传新图（成功前绝不动旧图；失败则屏幕继续显示昨天的图，安全降级）
+    try:
+        with open(png_path, "rb") as f:
+            resp = requests.post(
+                f"{FUNNYCOO_BASE}/api/upload-photo",
+                data={"devId": devid},
+                files={"file": ("today.png", f, "image/png")},
+                timeout=30,
+            )
+        data = resp.json()
+        if not (resp.status_code == 200 and data.get("success")):
+            print(f"⚠️ 推送到墨水屏相册失败: HTTP {resp.status_code} {data}")
+            return
+        new_id = data["data"]["id"]
+        print(f"🖼️ 已推送到墨水屏相册: {new_id}")
+    except Exception as e:
+        print(f"⚠️ 推送到墨水屏相册出错（屏幕将继续显示旧图）: {e}")
+        return
+    # 2) 新图就位后，删掉相册里其余旧图（相册只剩一张 = 固定显示它，不会随机轮播）
+    try:
+        plist = requests.get(f"{FUNNYCOO_BASE}/api/photo-list/{devid}", timeout=15).json()
+        for p in plist.get("data", []):
+            if p.get("id") != new_id:
+                requests.delete(
+                    f"{FUNNYCOO_BASE}/api/delete-photo/{devid}/{p['id']}", timeout=15
+                )
+                print(f"   🗑️ 已删除相册旧图: {p.get('name', p['id'])}")
+    except Exception as e:
+        print(f"⚠️ 清理相册旧图失败（新图不受影响，最多新旧图随机轮播）: {e}")
+
+
+def refresh_eink_display(today_tasks):
+    """渲染今日任务图 + 推送到墨水屏相册（一体完成，任一步失败都只警告）"""
+    render_today_image(today_tasks)
+    push_photo_to_funnycoo(EINK_OUTPUT_FILE)
+
+
 def main():
     check_only = "--check-only" in sys.argv
     reset_mode = "--reset" in sys.argv
@@ -655,9 +718,9 @@ def main():
                              if is_valid_task(t["fields"])
                              and extract_field_value(t["fields"], "是否今日") is True]
                 order_tasks_by_view(today_now, today_view_id)
-                render_today_image(today_now)
+                refresh_eink_display(today_now)
             except Exception as e:
-                print(f"⚠️ 墨水屏图片生成失败: {e}")
+                print(f"⚠️ 墨水屏图片生成/推送失败: {e}")
             return
 
     # 1. 获取所有任务（Grid View 行顺序），过滤空记录
@@ -778,11 +841,11 @@ def main():
     }
     print(f"最终待办: {len(final_today)}条（新增{len(new_tasks)}条，延续{len(remaining_tasks)}条）")
 
-    # 10.1 渲染墨水屏图片（失败不影响推送）
+    # 10.1 渲染墨水屏图片并推送到 funnycoo 相册（失败不影响推送）
     try:
-        render_today_image(final_today)
+        refresh_eink_display(final_today)
     except Exception as e:
-        print(f"⚠️ 墨水屏图片生成失败（不影响飞书推送）: {e}")
+        print(f"⚠️ 墨水屏图片生成/推送失败（不影响飞书推送）: {e}")
 
     # 高频检查模式：无新补充则静默退出
     if check_only and len(new_tasks) == 0:
