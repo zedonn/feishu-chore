@@ -23,24 +23,30 @@
 - 推送显示名依次取：小区域 → 具体区域描述 → （见表格参考图片）
 - 所有批量写操作走飞书批量接口（单包最多450条，自动分包），速度从
   "每行1~3秒"降到"全部1~3秒"；批量被拒时自动降级逐行更新，定位问题行
+- 墨水屏图片（阶段一新增）：推送流程结束后，把今日任务渲染成 400x300 PNG
+  存到 docs/today.png，由 GitHub Actions 提交进仓库、经 GitHub Pages 对外展示；
+  "今天已推送过"的早退分支也会刷新图片（方便白天手动测试）；
+  图片生成失败只打警告，绝不影响飞书推送
 
 环境变量（必填）：
   LARK_APP_ID      飞书自建应用的 App ID
   LARK_APP_SECRET  飞书自建应用的 App Secret
 
 环境变量（可选，有默认值）：
-  LARK_BASE_TOKEN     多维表格 token
-  LARK_TASK_TABLE_ID  家务任务表 ID
-  LARK_CONFIG_TABLE_ID 系统配置表 ID
-  LARK_DEFAULT_VIEW_ID 默认视图 ID
-  LARK_USER_OPEN_ID   推送目标用户的 open_id
-  CHORE_DAILY_COUNT   每天待办数量，默认5
+  LARK_BASE_TOKEN          多维表格 token
+  LARK_TASK_TABLE_ID       家务任务表 ID
+  LARK_CONFIG_TABLE_ID     系统配置表 ID
+  LARK_DEFAULT_VIEW_ID     默认视图 ID
+  LARK_USER_OPEN_ID        推送目标用户的 open_id
+  CHORE_DAILY_COUNT        每天待办数量，默认5
 """
+
 import json
 import os
 import sys
 import time
 from datetime import datetime, timezone, timedelta
+
 import requests
 
 # ============ 配置 ============
@@ -53,10 +59,10 @@ DAILY_COUNT = int(os.environ.get("CHORE_DAILY_COUNT", "5"))
 
 APP_ID = os.environ.get("LARK_APP_ID", "")
 APP_SECRET = os.environ.get("LARK_APP_SECRET", "")
-
 API_BASE = "https://open.feishu.cn/open-apis"
 BEIJING_TZ = timezone(timedelta(hours=8))
 LOG_TABLE_NAME = "完成记录"
+
 
 # ============ 飞书 API 基础封装 ============
 _tenant_token = None
@@ -100,14 +106,14 @@ def api_request(method, path, params=None, json_body=None):
         result = resp.json()
     except Exception:
         print(f"❌ API 返回非 JSON [{method} {path}]")
-        print(f"  HTTP状态码: {resp.status_code}")
-        print(f"  请求体: {json.dumps(json_body, ensure_ascii=False)[:300] if json_body else '无'}")
-        print(f"  响应前500字: {resp.text[:500]}")
+        print(f"   HTTP状态码: {resp.status_code}")
+        print(f"   请求体: {json.dumps(json_body, ensure_ascii=False)[:300] if json_body else '无'}")
+        print(f"   响应前500字: {resp.text[:500]}")
         return {"code": -1, "msg": "非JSON响应"}
     if result.get("code") != 0:
         print(f"❌ API错误 [{method} {path}]")
-        print(f"  code: {result.get('code')}, msg: {result.get('msg')}")
-        print(f"  请求体: {json.dumps(json_body, ensure_ascii=False)[:300] if json_body else '无'}")
+        print(f"   code: {result.get('code')}, msg: {result.get('msg')}")
+        print(f"   请求体: {json.dumps(json_body, ensure_ascii=False)[:300] if json_body else '无'}")
     return result
 
 
@@ -134,7 +140,8 @@ def list_records(table_id, view_id=None, page_size=200):
         if not data.get("has_more"):
             break
         page_token = data.get("page_token")
-    return [{"record_id": item["record_id"], "fields": item.get("fields", {})} for item in all_items]
+    return [{"record_id": item["record_id"], "fields": item.get("fields", {})}
+            for item in all_items]
 
 
 def update_record(table_id, record_id, fields):
@@ -343,7 +350,6 @@ def renumber_by_row_order(tasks):
         if current_seq != expected_seq:
             updates.append((t["record_id"], {"序号": expected_seq}))
             changes.append(f"{current_seq or '空'}→{expected_seq}")
-
     if updates:
         batch_update_records(TASK_TABLE_ID, updates)
         print(f"序号原位重排完成：批量更新了 {len(updates)} 条（条目位置不变）")
@@ -394,11 +400,9 @@ def log_completed_tasks(done_tasks):
     if not table_id:
         print("⚠️ 完成记录表不可用，跳过记录")
         return
-
     now = datetime.now(BEIJING_TZ)
     day_start = datetime(now.year, now.month, now.day, tzinfo=BEIJING_TZ)
     date_ts = int(day_start.timestamp() * 1000)  # 日期字段用毫秒时间戳
-
     records = []
     for t in done_tasks:
         small = extract_field_value(t["fields"], "小区域")
@@ -413,7 +417,6 @@ def log_completed_tasks(done_tasks):
                 "具体区域描述": desc,
             }
         })
-
     result = api_request(
         "POST",
         f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/batch_create",
@@ -439,7 +442,6 @@ def send_message(task_info):
         f"📋 共 {total_today} 条待办（新增 {new_count} 条，延续 {remaining_count} 条）",
         "",
     ]
-
     new_tasks = [t for t in tasks if t["record_id"] in new_task_ids]
     if new_tasks:
         lines.append("🆕 新增：")
@@ -466,6 +468,92 @@ def send_message(task_info):
     return send_text_message(USER_OPEN_ID, message)
 
 
+# ============ 墨水屏图片渲染（阶段一新增） ============
+# 每天把今日任务画成一张 400x300 的 PNG，存到仓库 docs/today.png，
+# 由 GitHub Actions 提交进仓库，再通过 GitHub Pages 对公网开放；
+# 墨水屏（中转模式）定时来抓这张图显示。
+# 渲染失败只打警告，绝不影响飞书推送主流程。
+
+SCREEN_W, SCREEN_H = 400, 300
+EINK_OUTPUT_DIR = "docs"
+EINK_OUTPUT_FILE = os.path.join(EINK_OUTPUT_DIR, "today.png")
+
+
+def _find_font():
+    """找中文字体文件（按优先级依次尝试）"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, "NotoSansCJKsc-Regular.otf"),
+        os.path.join(script_dir, "NotoSansSC-Regular.otf"),
+        os.path.join(script_dir, "assets", "NotoSansCJKsc-Regular.otf"),
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _truncate_text(draw, text, font, max_width):
+    """按像素宽度截断文字，超长以…结尾"""
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    while text and draw.textlength(text + "…", font=font) > max_width:
+        text = text[:-1]
+    return text + "…"
+
+
+def render_today_image(today_tasks):
+    """把今日任务渲染成 400x300 PNG，写到 docs/today.png"""
+    from PIL import Image, ImageDraw, ImageFont  # 用到才导入，没装 Pillow 不影响推送
+
+    font_path = _find_font()
+    if not font_path:
+        print("⚠️ 找不到中文字体文件，跳过墨水屏图片生成（不影响飞书推送）")
+        print("   请把 NotoSansCJKsc-Regular.otf 上传到仓库根目录后重试")
+        return
+
+    # .ttc 是字体集合文件，index=2 取简体中文子字体；普通 .otf 用 index=0
+    index = 2 if font_path.endswith(".ttc") else 0
+
+    img = Image.new("RGB", (SCREEN_W, SCREEN_H), "white")
+    draw = ImageDraw.Draw(img)
+
+    f_title = ImageFont.truetype(font_path, 28, index=index)
+    f_task = ImageFont.truetype(font_path, 22, index=index)
+    f_small = ImageFont.truetype(font_path, 15, index=index)
+
+    RED = (190, 30, 30)
+    BLACK = (30, 30, 30)
+    GRAY = (140, 140, 140)
+
+    # 顶部红色标题条
+    draw.rectangle([0, 0, SCREEN_W, 48], fill=RED)
+    now = datetime.now(BEIJING_TZ)
+    draw.text((14, 9), f"今日家务 {now.month}月{now.day}日", font=f_title, fill="white")
+
+    # 任务列表
+    y = 66
+    if not today_tasks:
+        draw.text((14, y), "今天没有待办任务，好好休息！", font=f_task, fill=BLACK)
+    else:
+        for i, t in enumerate(today_tasks, 1):
+            area = extract_field_value(t["fields"], "大区域")
+            name = get_task_display_name(t["fields"])
+            line = f"{i}. [{area}] {name}" if area else f"{i}. {name}"
+            line = _truncate_text(draw, line, f_task, SCREEN_W - 28)
+            draw.text((14, y), line, font=f_task, fill=BLACK)
+            y += 38
+
+    # 底部时间戳角标：专门用来排查"趣联服务器是否缓存了旧图"
+    draw.text((14, SCREEN_H - 26), "更新于 " + now.strftime("%Y-%m-%d %H:%M"),
+              font=f_small, fill=GRAY)
+
+    os.makedirs(EINK_OUTPUT_DIR, exist_ok=True)
+    img.save(EINK_OUTPUT_FILE, "PNG")
+    print(f"🖼️ 已生成墨水屏图片: {EINK_OUTPUT_FILE}（共 {len(today_tasks)} 条任务）")
+
+
 def main():
     check_only = "--check-only" in sys.argv
     reset_mode = "--reset" in sys.argv
@@ -477,12 +565,23 @@ def main():
     # 0. 防重复保险：今天已推送过就直接退出
     #    （cron-job.org 主闹钟 + GitHub schedule 备用闹钟可能同一天都触发；
     #    --reset 和 --check-only 模式不受此限制）
+    #    阶段一新增：就算跳过推送，也顺手刷新一次墨水屏图片，
+    #    以表格当前状态为准 —— 这样白天手动测试也能拿到图
     today_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
     if not check_only and not reset_mode:
         config = get_config()
         if config.get("上次推送日期") == today_str:
-            print(f"✅ 今天（{today_str}）已经推送过了，本次跳过")
+            print(f"✅ 今天（{today_str}）已经推送过了，本次跳过推送")
             print("   如需强制重推：把配置表「上次推送日期」的值改成别的，再重新运行")
+            try:
+                tasks_now = get_all_tasks_in_order()
+                today_now = [t for t in tasks_now
+                             if is_valid_task(t["fields"])
+                             and extract_field_value(t["fields"], "是否今日") is True]
+                today_now.sort(key=get_seq)
+                render_today_image(today_now)
+            except Exception as e:
+                print(f"⚠️ 墨水屏图片生成失败: {e}")
             return
 
     # 1. 获取所有任务（按默认视图行顺序），过滤空记录
@@ -490,7 +589,6 @@ def main():
     total = len(tasks)
     valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
     print(f"当前任务总数: {total}，有效任务: {len(valid_tasks)}")
-
     if len(valid_tasks) == 0:
         print("没有有效任务，无法推送")
         return
@@ -516,7 +614,8 @@ def main():
     if stale_today:
         print(f"⚠️ 发现 {len(stale_today)} 条空记录残留「是否今日」标记，自动清理")
         batch_update_records(
-            TASK_TABLE_ID, [(t["record_id"], {"是否今日": False}) for t in stale_today]
+            TASK_TABLE_ID,
+            [(t["record_id"], {"是否今日": False}) for t in stale_today]
         )
     today_tasks = [t for t in all_today if t["record_id"] in valid_ids]
     print(f"当前待办数: {len(today_tasks)}")
@@ -538,10 +637,10 @@ def main():
 
     # 6.1 把完成的任务写入「完成记录」表
     log_completed_tasks(done_tasks)
-
     if done_tasks:
         batch_update_records(
-            TASK_TABLE_ID, [(t["record_id"], {"是否今日": False}) for t in done_tasks]
+            TASK_TABLE_ID,
+            [(t["record_id"], {"是否今日": False}) for t in done_tasks]
         )
 
     # 7. 一轮完成判定【提前到补充之前】：
@@ -549,7 +648,8 @@ def main():
     if all(extract_field_value(t["fields"], "完成") is True for t in valid_tasks):
         print("🎉 完成一轮循环，清空所有任务的完成状态，开启新一轮")
         batch_update_records(
-            TASK_TABLE_ID, [(t["record_id"], {"完成": False}) for t in valid_tasks]
+            TASK_TABLE_ID,
+            [(t["record_id"], {"完成": False}) for t in valid_tasks]
         )
         # 重新拉取，确保后续补充逻辑读到的是清空后的状态
         tasks = get_all_tasks_in_order()
@@ -576,6 +676,7 @@ def main():
             max_index = max(i for i, t in enumerate(valid_tasks) if t["record_id"] in today_ids)
         else:
             max_index = -1
+
         candidates = []
         n = len(valid_tasks)
         for offset in range(1, n + 1):
@@ -590,7 +691,8 @@ def main():
                 break
         new_tasks = candidates[:need_to_add]
         batch_update_records(
-            TASK_TABLE_ID, [(t["record_id"], {"是否今日": True}) for t in new_tasks]
+            TASK_TABLE_ID,
+            [(t["record_id"], {"是否今日": True}) for t in new_tasks]
         )
         print(f"已补充: {len(new_tasks)}条")
         if len(new_tasks) < need_to_add:
@@ -601,7 +703,6 @@ def main():
     valid_tasks = [t for t in tasks if is_valid_task(t["fields"])]
     final_today = [t for t in valid_tasks if extract_field_value(t["fields"], "是否今日") is True]
     final_today.sort(key=get_seq)
-
     task_info = {
         "total_today": len(final_today),
         "new_count": len(new_tasks),
@@ -609,8 +710,13 @@ def main():
         "tasks": final_today,
         "new_task_ids": {t["record_id"] for t in new_tasks},
     }
-
     print(f"最终待办: {len(final_today)}条（新增{len(new_tasks)}条，延续{len(remaining_tasks)}条）")
+
+    # 10.1 【阶段一新增】渲染墨水屏图片（失败不影响推送）
+    try:
+        render_today_image(final_today)
+    except Exception as e:
+        print(f"⚠️ 墨水屏图片生成失败（不影响飞书推送）: {e}")
 
     # 高频检查模式：如果没有新补充的任务，静默退出
     if check_only and len(new_tasks) == 0:
