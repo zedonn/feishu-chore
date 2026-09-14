@@ -376,7 +376,7 @@ def fit_contain(photo, box_w, box_h):
 def global_chore_progress():
     """全表家务进度（完成✔数 ÷ 有效任务总数）"""
     records = list_records(TASK_TABLE_ID, DEFAULT_VIEW_ID)
-    valid = [r for r in records if is_valid_task(r)]
+    valid = [r for r in records if is_valid_task(r["fields"])]
     if not valid:
         return 0
     done = sum(1 for r in valid if r["fields"].get("完成"))
@@ -661,7 +661,7 @@ def refresh_eink_only():
         print("⚠️ 配置表缺少「墨水屏设备ID」，无法刷新")
         return
     records = list_records(TASK_TABLE_ID, DEFAULT_VIEW_ID)
-    valid = [r for r in records if is_valid_task(r)]
+    valid = [r for r in records if is_valid_task(r["fields"])]
     todo = [r for r in valid if r["fields"].get("是否今日")]
     current = next((r for r in todo if not r["fields"].get("完成")), todo[0] if todo else None)
     chore_pct = global_chore_progress()
@@ -688,7 +688,7 @@ def main():
 
     print("===== 拉取任务数据 =====")
     records = list_records(TASK_TABLE_ID, DEFAULT_VIEW_ID)
-    valid = [r for r in records if is_valid_task(r)]
+    valid = [r for r in records if is_valid_task(r["fields"])]
     print(f"共 {len(records)} 行，有效任务 {len(valid)} 条")
 
     # 序号原位重排（保持 Grid 视图行序）
@@ -711,7 +711,7 @@ def main():
                          for r in valid if r["fields"].get("完成")]
         batch_update(TASK_TABLE_ID, clear_updates)
         records = list_records(TASK_TABLE_ID, DEFAULT_VIEW_ID)
-        valid = [r for r in records if is_valid_task(r)]
+        valid = [r for r in records if is_valid_task(r["fields"])]
         todo = [r for r in valid if r["fields"].get("是否今日")]
         done_today = [r for r in todo if r["fields"].get("完成")]
 
@@ -780,7 +780,6 @@ def main():
     dev_id = get_funnycoo_devid(cfg)
     if dev_id:
         push_photo_to_funnycoo(buf.getvalue(), dev_id)
-        refresh_eink_display(dev_id)
     else:
         print("⚠️ 配置表缺少「墨水屏设备ID」，跳过推送")
 
