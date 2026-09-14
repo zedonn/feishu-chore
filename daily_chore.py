@@ -158,9 +158,11 @@ def list_records(table_id, view_id=None, filter_str=None):
 
 
 def batch_update(table_id, updates):
-    """批量更新记录（单包最多450条）"""
+    """批量更新记录（单包最多450条；兼容 (record_id, fields) 元组写法）"""
     if not updates:
         return {"code": 0}
+    updates = [{"record_id": u[0], "fields": u[1]} if not isinstance(u, dict) else u
+               for u in updates]
     url = f"/bitable/v1/apps/{BASE_TOKEN}/tables/{table_id}/records/batch_update"
     CHUNK = 450
     last_result = {"code": 0}
