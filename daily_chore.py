@@ -510,6 +510,21 @@ def run_preview(mode):
 
 
 # ============ 主流程 ============
+# 序号安全转 int：2026-09-14 实测飞书 API 对「序号」数字字段返回字符串
+# ('7'/'25')，字符串比较导致补位全灭（每天"补充 0 条"）、重排每天误判 82 行。
+# 统一强转，数字/字符串/空值全兼容。
+def _seq(fields):
+    v = fields.get("序号")
+    if v is None or isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
 def is_valid_task(f):
     """有效任务判定：「小区域」「参考图片」「具体区域描述」任意一个有内容即算有效"""
     if f.get("参考图片"):  # 附件字段：非空列表即有效
@@ -561,7 +576,7 @@ def main():
     seq_fields = {f["field_name"]: f for f in list_fields(TASK_TABLE_ID)}
     if "序号" in seq_fields and seq_fields["序号"].get("ui_type") != "AutoNumber":
         for i, r in enumerate(valid, 1):
-            if r["fields"].get("序号") != i:
+            if _seq(r["fields"]) != i:
                 updates.append((r["record_id"], {"序号": i}))
         if updates:
             print(f"序号重排 {len(updates)} 行")
@@ -599,7 +614,7 @@ def main():
     todo = [r for r in todo if r not in done_today]
 
     # 待办超限清理（按序号）
-    todo.sort(key=lambda r: r["fields"].get("序号") or 9999)
+    todo.sort(key=lambda r: _seq(r["fields"]) or 9999)
     if len(todo) > DAILY_COUNT:
         for r in todo[DAILY_COUNT:]:
             updates.append((r["record_id"], {"是否今日": False}))
@@ -608,11 +623,11 @@ def main():
     # 智能补充：从延续任务最后位置按行序往后取，跳过今日和已完成
     lack = DAILY_COUNT - len(todo)
     if lack > 0:
-        last_seq = max((r["fields"].get("序号") or 0) for r in todo) if todo else 0
-        todo_seqs = {r["fields"].get("序号") for r in todo}
+        last_seq = max((_seq(r["fields"]) for r in todo), default=0) if todo else 0
+        todo_seqs = {_seq(r["fields"]) for r in todo}
         picked = []
         for r in valid:
-            seq = r["fields"].get("序号") or 0
+            seq = _seq(r["fields"])
             if r["fields"].get("完成") or seq in todo_seqs or seq <= (last_seq if todo else 0):
                 continue
             picked.append(r)
@@ -646,8 +661,7 @@ def main():
 
     # ---- 飞书推送 ----
     if todo:
-        lines = [f"{i+1}. {task_name(r['fields'])}" for i, r in enumerate(todo)]
-        send_text_message("今日家务任务：\n" + "\n".join(lines))
+        # 飞书私信推送已按用户要求移除（2026-09-14，有墨水屏不需要私信）
         set_config(cfg, "上次推送日期", beijing_today())
         print(f"✅ 已推送 {len(todo)} 条任务")
     else:
